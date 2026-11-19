@@ -1,0 +1,14 @@
+{
+    "id": "nvidia/glm-5.3",
+    "provider": "Nvidia",
+    "model": "z-ai/glm-5.3-flash",
+    "vault": {
+        "vendor": "nvidia",
+        "credential_slot": "nvidia_api_keys",
+        "endpoint_slot": "nvidia_api_endpoints"
+    },
+    "behavior": "chat-credential-drain",
+    "credential_advance": "next-on-every-rotation",
+    "enabled": false,
+    "context_length": 262144
+}

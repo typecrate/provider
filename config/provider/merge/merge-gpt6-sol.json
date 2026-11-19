@@ -1,0 +1,21 @@
+{
+    "id": "merge/gpt-6-1-sol",
+    "provider": "Merge",
+    "model": "openai/gpt-6.1-sol",
+    "vault": {
+        "vendor": "merge",
+        "credential_slot": "merge_api_keys",
+        "endpoint_slot": "merge_api_endpoints"
+    },
+    "behavior": "chat-routed",
+    "routing_vendor": "openai",
+    "pricing": {
+        "input": 2,
+        "cache_read": 0.1,
+        "output": 10
+    },
+    "enabled": false,
+    "reasoning_effort": "medium",
+    "coerce_none_effort": true,
+    "context_length": 262144
+}

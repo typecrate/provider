@@ -1,0 +1,19 @@
+{
+    "id": "merge/kimi-k3",
+    "provider": "Merge",
+    "model": "moonshot/kimi-k3",
+    "vault": {
+        "vendor": "merge",
+        "credential_slot": "merge_api_keys",
+        "endpoint_slot": "merge_api_endpoints"
+    },
+    "behavior": "chat-routed",
+    "routing_vendor": "modal",
+    "pricing": {
+        "input": 3,
+        "cache_read": 0.3,
+        "output": 15
+    },
+    "enabled": false,
+    "context_length": 262144
+}

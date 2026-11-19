@@ -1,0 +1,19 @@
+{
+    "id": "makora/glm-5.3",
+    "provider": "Makora",
+    "model": "zai-org/GLM-5.3",
+    "vault": {
+        "vendor": "makora",
+        "credential_slot": "makora_api_keys",
+        "endpoint_slot": "makora_api_endpoints"
+    },
+    "behavior": "chat-credential-drain",
+    "credential_advance": "same-then-next",
+    "pricing": {
+        "input": 0.72,
+        "cache_read": 0.12,
+        "output": 2.38
+    },
+    "enabled": true,
+    "context_length": 262144
+}

@@ -1,0 +1,19 @@
+{
+    "id": "open-router/glm-5.3-flash",
+    "provider": "Open Router",
+    "model": "z-ai/glm-5.3-flash",
+    "vault": {
+        "vendor": "open_router",
+        "credential_slot": "open_router_api_keys",
+        "endpoint_slot": "open_router_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 0.075,
+        "cache_read": 0.015,
+        "output": 0.25
+    },
+    "enabled": true,
+    "reasoning_effort": "max",
+    "context_length": 262144
+}

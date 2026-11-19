@@ -1,0 +1,19 @@
+{
+    "id": "sail/glm5-flash",
+    "provider": "Sail",
+    "model": "zai-org/GLM-5.3-Flash",
+    "vault": {
+        "vendor": "sail",
+        "credential_slot": "sail_api_keys",
+        "endpoint_slot": "sail_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 0.11,
+        "cache_read": 0.02,
+        "output": 0.35
+    },
+    "enabled": true,
+    "reasoning_effort": "max",
+    "context_length": 262144
+}

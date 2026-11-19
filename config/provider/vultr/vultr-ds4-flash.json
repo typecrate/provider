@@ -1,0 +1,19 @@
+{
+    "id": "vultr/ds4-flash",
+    "provider": "Vultr",
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "vault": {
+        "vendor": "vultr",
+        "credential_slot": "vultr_api_keys",
+        "endpoint_slot": "vultr_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 0.15,
+        "cache_read": 0.15,
+        "output": 0.6
+    },
+    "enabled": false,
+    "reasoning_effort": "high",
+    "context_length": 262144
+}

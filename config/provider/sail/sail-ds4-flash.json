@@ -1,0 +1,19 @@
+{
+    "id": "sail/ds4-flash",
+    "provider": "Sail",
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "vault": {
+        "vendor": "sail",
+        "credential_slot": "sail_api_keys",
+        "endpoint_slot": "sail_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 0.09,
+        "cache_read": 0.006,
+        "output": 0.3
+    },
+    "enabled": true,
+    "reasoning_effort": "high",
+    "context_length": 262144
+}

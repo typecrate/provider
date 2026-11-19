@@ -1,0 +1,18 @@
+{
+    "id": "token-router/glm-5.3",
+    "provider": "Token Router",
+    "model": "z-ai/glm-5.3-free",
+    "vault": {
+        "vendor": "token_router",
+        "credential_slot": "token_router_api_keys",
+        "endpoint_slot": "token_router_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 1.4,
+        "cache_read": 0.26,
+        "output": 4.4
+    },
+    "enabled": true,
+    "context_length": 262144
+}

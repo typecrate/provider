@@ -1,0 +1,14 @@
+{
+    "id": "nvidia/kimi-k3",
+    "provider": "Nvidia",
+    "model": "moonshotai/kimi-k3",
+    "vault": {
+        "vendor": "nvidia",
+        "credential_slot": "nvidia_api_keys",
+        "endpoint_slot": "nvidia_api_endpoints"
+    },
+    "behavior": "chat-credential-drain",
+    "credential_advance": "next-on-every-rotation",
+    "enabled": false,
+    "context_length": 262144
+}

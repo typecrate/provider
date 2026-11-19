@@ -1,0 +1,20 @@
+{
+    "id": "token-router/sol",
+    "provider": "Token Router",
+    "model": "openai/gpt-6.1-sol",
+    "vault": {
+        "vendor": "token_router",
+        "credential_slot": "token_router_api_keys",
+        "endpoint_slot": "token_router_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 2,
+        "cache_read": 0.1,
+        "output": 10
+    },
+    "enabled": true,
+    "reasoning_effort": "medium",
+    "coerce_none_effort": true,
+    "context_length": 262144
+}

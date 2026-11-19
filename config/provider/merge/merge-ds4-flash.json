@@ -1,0 +1,20 @@
+{
+    "id": "merge/ds4-flash",
+    "provider": "Merge",
+    "model": "deepseek/deepseek-v4.1-flash-1017",
+    "vault": {
+        "vendor": "merge",
+        "credential_slot": "merge_api_keys",
+        "endpoint_slot": "merge_api_endpoints"
+    },
+    "behavior": "chat-routed",
+    "routing_vendor": "deepinfra",
+    "pricing": {
+        "input": 0.2,
+        "cache_read": 0.006,
+        "output": 0.6
+    },
+    "enabled": false,
+    "reasoning_effort": "high",
+    "context_length": 262144
+}

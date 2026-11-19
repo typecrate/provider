@@ -1,0 +1,20 @@
+{
+    "id": "merge/mimo-2-6",
+    "provider": "Merge",
+    "model": "xiaomimimo/mimo-v2.6-pro",
+    "vault": {
+        "vendor": "merge",
+        "credential_slot": "merge_api_keys",
+        "endpoint_slot": "merge_api_endpoints"
+    },
+    "behavior": "chat-routed",
+    "routing_vendor": "deepinfra",
+    "pricing": {
+        "input": 0.43,
+        "cache_read": 0.004,
+        "output": 0.87
+    },
+    "enabled": false,
+    "reasoning_effort": "high",
+    "context_length": 262144
+}

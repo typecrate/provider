@@ -1,0 +1,19 @@
+{
+    "id": "sail/glm5",
+    "provider": "Sail",
+    "model": "zai-org/GLM-5.3",
+    "vault": {
+        "vendor": "sail",
+        "credential_slot": "sail_api_keys",
+        "endpoint_slot": "sail_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 0.98,
+        "cache_read": 0.18,
+        "output": 3.08
+    },
+    "enabled": true,
+    "reasoning_effort": "max",
+    "context_length": 262144
+}

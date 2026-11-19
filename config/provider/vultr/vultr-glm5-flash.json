@@ -1,0 +1,19 @@
+{
+    "id": "vultr/glm-5.3-flash",
+    "provider": "Vultr",
+    "model": "glm-5.3-flash",
+    "vault": {
+        "vendor": "vultr",
+        "credential_slot": "vultr_api_keys",
+        "endpoint_slot": "vultr_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 0.1,
+        "cache_read": 0.1,
+        "output": 0.35
+    },
+    "enabled": false,
+    "reasoning_effort": "max",
+    "context_length": 262144
+}

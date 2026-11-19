@@ -1,0 +1,19 @@
+{
+    "id": "vultr/mimo-2-6",
+    "provider": "Vultr",
+    "model": "mimo-v2.6-pro-rl",
+    "vault": {
+        "vendor": "vultr",
+        "credential_slot": "vultr_api_keys",
+        "endpoint_slot": "vultr_api_endpoints"
+    },
+    "behavior": "chat-plain",
+    "pricing": {
+        "input": 0.44,
+        "cache_read": 0.44,
+        "output": 0.87
+    },
+    "enabled": false,
+    "reasoning_effort": "high",
+    "context_length": 262144
+}

@@ -2,8 +2,9 @@
 //!
 //! # Typecrate port - source lineage
 //!
-//! TypeScript origin: `packages/agentic/provider/src/registry.ts` (`privateClients`) and
-//! the two consumers that define what the registry is FOR:
+//! TypeScript origin: `packages/agentic/provider/src/registry.ts` (`privateClients` - the
+//! row CONTENTS; this crate's order is alphabetical by id, see `crate::clients`) and the
+//! two consumers that define what the registry is FOR:
 //! `runtime/endpoint/provider/private/chat-completion/private-chat-completion.ts`
 //! (lookup by id) and
 //! `runtime/endpoint/provider/private/models/service-route.ts` (the catalog's filtered,
@@ -11,12 +12,11 @@
 //!
 //! ## Three properties this type exists to hold
 //!
-//!   1. **ORDER.** The list is built in `crate::clients` order and never re-sorted.
-//!      `registry.ts` says why, entry by entry: every client was appended "to preserve all
-//!      existing registry indices", and the TypeScript's tests assert positions
-//!      (`src/index.test.ts`, and the chat-completion test's `privateClients[0]`). The
-//!      catalog inherits that order (`service-route.ts` filters without sorting), while
-//!      `/stats` re-sorts by id on its own projection (`private-stats.ts:285`) - so order
+//!   1. **ORDER.** The list is built in `crate::clients` order and never re-sorted. That
+//!      order is alphabetical by id, computed once by `build.rs` from `config/provider/**/*.json`; it
+//!      is deterministic and independent of file names. The catalog inherits it
+//!      (`service-route.ts` filters without sorting), while `/stats` re-sorts by id on its
+//!      own projection (`private-stats.ts:285`, which lands on the same order) - so order
 //!      must be preserved HERE and must not be "helpfully" normalised.
 //!
 //!   2. **ONE SHARED INSTANCE PER ROW.** Each row yields exactly one [`ModelClient`], and

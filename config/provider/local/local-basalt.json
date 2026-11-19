@@ -1,0 +1,20 @@
+{
+    "id": "local/basalt",
+    "provider": "Local",
+    "model": "local/basalt",
+    "vault": {
+        "vendor": "basalt",
+        "credential_slot": null,
+        "endpoint_slot": "local_basalt_api_endpoints"
+    },
+    "behavior": "chat-keyless-relay",
+    "pricing": {
+        "input": 0.1,
+        "cache_read": 0.01,
+        "output": 0.6
+    },
+    "enabled": true,
+    "reasoning_effort": "xhigh",
+    "output_cap": 32768,
+    "context_length": 262144
+}

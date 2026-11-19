@@ -1,0 +1,20 @@
+{
+    "id": "merge/glm-5.3-flash",
+    "provider": "Merge",
+    "model": "zai/glm-5.3-flash",
+    "vault": {
+        "vendor": "merge",
+        "credential_slot": "merge_api_keys",
+        "endpoint_slot": "merge_api_endpoints"
+    },
+    "behavior": "chat-routed",
+    "routing_vendor": "pareto",
+    "pricing": {
+        "input": 0.15,
+        "cache_read": 0.03,
+        "output": 0.5
+    },
+    "enabled": false,
+    "reasoning_effort": "max",
+    "context_length": 262144
+}

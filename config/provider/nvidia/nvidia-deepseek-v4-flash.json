@@ -1,0 +1,14 @@
+{
+    "id": "nvidia/deepseek-v4-flash",
+    "provider": "Nvidia",
+    "model": "deepseek-ai/deepseek-v4-flash-0731",
+    "vault": {
+        "vendor": "nvidia",
+        "credential_slot": "nvidia_api_keys",
+        "endpoint_slot": "nvidia_api_endpoints"
+    },
+    "behavior": "chat-credential-drain",
+    "credential_advance": "next-on-every-rotation",
+    "enabled": false,
+    "context_length": 262144
+}

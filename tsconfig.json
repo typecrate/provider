@@ -1,0 +1,15 @@
+// tsconfig.json — the TypeScript surface of this package is scripts/*.ts ONLY.
+// The Rust crate is checked by cargo (`check` / `lint:strict` / `test`), so neither it
+// nor any generated artifact belongs here. Extends the root config, whose
+// `exclude` already drops **/*.test.ts — so `yarn typecheck` covers the production
+// scripts and vitest owns the colocated test files.
+// Precedent: packages/typecrate/nexus/tsconfig.json (the same shape, and the same
+// three-level depth, so the repo-root config is ../../../tsconfig.json). The caveat that
+// file records still applies to a standalone checkout of THIS repository: the root config
+// and the workspace packages the scripts import (@config/vault, @services/daytona) live
+// OUTSIDE it, so `tsc -p .` only resolves inside the noobscript monorepo — which is also
+// why .github/workflows/ci.yml runs cargo and nothing else.
+{
+    "extends": "../../../tsconfig.json",
+    "include": ["scripts/**/*.ts"]
+}

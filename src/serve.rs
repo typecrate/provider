@@ -112,7 +112,8 @@ use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use futures_util::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
@@ -712,6 +713,122 @@ impl Stream for Relay {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The gateway surface a standalone host needs: cross-origin policy, preflight, readiness
+// ---------------------------------------------------------------------------
+//
+// WHY THIS LIVES HERE AND NOT IN THE BIN: the four handlers are `pub` for exactly one reason -
+// so a host that is not `typecrate-services` can mount them. A host that mounts them still has
+// to answer CORS the same way, or the same request is `200` behind the services router and
+// opaque-origin-blocked in front of a container. These items are that "same way", stated once.
+// They mirror `packages/typecrate/services/src/server/mod.rs:354-417` byte for byte in behaviour
+// (header set, preflight condition, `204`); the duplication is deliberate and temporary - the
+// follow-up is for services to call these and delete its private copies, which is out of scope
+// here because it edits the services crate and its `tests/server_http.rs` pins.
+//
+// WHY `any(...)` MAKES THE PREFLIGHT RULE NECESSARY: the mount delivers every verb to the
+// handlers (see `endpoint/provider/provider-route.rs`, "Why every group is `ANY`"), so a plain
+// `OPTIONS /providers/private/v1/models` is a ROUTED request the handler refuses with `400
+// {"error":"handler not found"}` - the TypeScript's own verb-miss verdict - and NOT a preflight.
+// Only an `OPTIONS` carrying `Access-Control-Request-Method` is a preflight, and only that one
+// short-circuits to `204` here. The same pair gates hono's `cors()`.
+
+/// The crate's own name on the wire, i.e. `[package] name` verbatim. [`crate::CRATE_NAME`] is the
+/// same identifier spelled for Rust (`_`), which is what `use` paths and log targets need; a
+/// readiness body names the PACKAGE, so the hyphenated spelling lives here.
+pub const SERVICE_NAME: &str = "typecrate-provider";
+
+/// `Access-Control-Allow-Private-Network` is not in the `http` crate's header table (it is a
+/// Chrome-specified response header that never became an RFC), so its name is spelled once here.
+/// `HeaderName::from_static` is a `const fn`, so the lowercase-normalised name is built at compile
+/// time and never re-parsed per request.
+pub const PRIVATE_NETWORK_ALLOW_HEADER: HeaderName =
+    HeaderName::from_static("access-control-allow-private-network");
+
+/// The value the three `Access-Control-Allow-*` headers carry: this host answers every origin,
+/// every verb and every header, exactly as the TS gateway does (`allowMethods: ['*']`,
+/// `allowHeaders: ['*']`).
+pub const GATEWAY_ALLOW_ALL: &str = "*";
+
+/// Adds the gateway's four cross-origin headers to `response`, replacing anything a handler set
+/// for them so the advertised policy is the transport's, not one endpoint can quietly narrow.
+#[must_use]
+pub fn with_gateway_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static(GATEWAY_ALLOW_ALL),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static(GATEWAY_ALLOW_ALL),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(GATEWAY_ALLOW_ALL),
+    );
+    // The PNA answer is `true` (not an echo): a client that did not ask for it ignores the header,
+    // and a client that did must not have to re-negotiate after a redirect.
+    headers.insert(
+        PRIVATE_NETWORK_ALLOW_HEADER,
+        HeaderValue::from_static("true"),
+    );
+
+    response
+}
+
+/// A CORS preflight, i.e. an `OPTIONS` that declares the verb it wants to send next
+/// (`Access-Control-Request-Method`) - see the block comment on this section for why the METHOD
+/// ALONE is not the test.
+#[must_use]
+pub fn is_cors_preflight(request: &Request) -> bool {
+    request.method() == Method::OPTIONS
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+}
+
+/// The outermost layer of any router that mounts these handlers: a preflight `204` before
+/// routing, otherwise the routed response with [`with_gateway_headers`] applied to it.
+///
+/// `Next`'s default body/state parameters are right here precisely because a host wires this
+/// layer AFTER `.with_state`, so it never has to name the state type - which is what lets the
+/// same layer wrap a `Router<ServeState>` (a test) and a `Router<()>` (the bin).
+///
+/// SSE survives this layer untouched: only `Response::headers_mut()` is touched, and a streamed
+/// body passes through `Next::run` without being buffered, so the `text/event-stream` frames
+/// still reach the socket incrementally.
+pub async fn gateway(request: Request, next: Next) -> Response {
+    if is_cors_preflight(&request) {
+        // Body-less by definition (`204` means "no body", and the CORS answer IS the response),
+        // so no media type is claimed and no body is drained.
+        return with_gateway_headers(StatusCode::NO_CONTENT.into_response());
+    }
+
+    with_gateway_headers(next.run(request).await)
+}
+
+/// The body of the readiness route a standalone listener answers: `{ok, service, version}`.
+///
+/// `ok` is unconditional, and that is the honest shape: this endpoint reports that a process is
+/// up and speaking HTTP, which is what a payload-agnostic TCP/HTTP readiness probe can ask.
+/// Whether the vault artifact was accepted is a different question with a different answer -
+/// every contract route says `503` with the regeneration command while it was not - and
+/// `src/bin/server.rs` refuses to bind at all in that state unless `--allow-unconfigured` was
+/// passed, so a `200` here is never a listener that is up but serving nothing.
+///
+/// Lives in the LIBRARY rather than in the bin because the bin's `/health` is its own route and
+/// is NOT one of [`MOUNT`]'s four - adding it to the route constants would change what
+/// `packages/typecrate/services` lists for this package.
+#[must_use]
+pub fn health_document() -> Value {
+    json!({
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": crate::version(),
+    })
 }
 
 // ---------------------------------------------------------------------------

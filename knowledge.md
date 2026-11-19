@@ -40,12 +40,28 @@ acceptance letters they cite.
    `typecrate-provider = { path = "../provider" }` in the services manifest
    (`packages/typecrate/services/Cargo.toml:92` as of this pass — that file is edited concurrently,
    so re-check the line before citing it).
-6. **Still to port** (each is listed in the crate's own "still to port" block, `src/lib.rs:29-38`):
+6. **C6 (done) — the crate's own process.** `src/bin/server.rs` is the `[[bin]]`
+   `typecrate-provider-server` (`Cargo.toml:70-72`): flags, the credential gate, one bind, the banner,
+   the shutdown signal and a hand-written `tracing` subscriber. To make that host stand alone,
+   `src/serve.rs` also published its gateway half — `with_gateway_headers` (`:758`),
+   `is_cors_preflight` (`:786`), `gateway` (`:803`) and the health document — so a container gets the
+   cross-origin policy and the preflight `204` without linking `typecrate-services`. Pinned by
+   `tests/bin_server.rs` (19) and `tests/gateway.rs` (8).
+7. **C7 (done) — pushing that process to a cloud container.** `scripts/deploy-endpoint.ts`,
+   `scripts/start-modal.ts`, `scripts/start-daytona.ts` (+ `scripts/entry-guard.ts`) are `vite-node`
+   verbs over the **shared** client `@services/daytona/sandbox` (`services/daytona/sandbox/runtime-deploy.ts`),
+   i.e. the same client nexus uses; `build:server` / `start:server` / `deploy:endpoint` / `start:modal` /
+   `start:daytona` / `typecheck` / `test:scripts` are the npm verbs. This is the first time this package
+   has had npm **dependencies** (`@config/vault`, `@services/daytona`) — which is what the
+   `.github/workflows/ci.yml` header now has to be careful about.
+8. **Still to port** (each is listed in the crate's own "still to port" block, `src/lib.rs:29-38`):
    the Daytona sandbox substrate behind `daytona/daytona-qwen3-8.ts` (S1 in the README ledger), the
    Lightning Chat↔Responses adapter (S2), and the `/stats` HTML dashboard with its cross-session
    buffer (S3, `runtime/endpoint/provider/private/stats/stats-buffer.ts`). Nothing else in the crate
-   is a placeholder.
-7. **Open parity decisions** a later stage has to settle, not implement blind: the port number
+   is a placeholder. **Do not read item 8 against item 7:** hosting *the provider itself* on Daytona (a
+   `start:daytona` sandbox) has nothing to do with the `daytona/qwen3.8-27b` **row**, whose upstream base
+   URL only exists after a GPU-sandbox boot — the row stays unported and `/models` still answers 11 rows.
+9. **Open parity decisions** a later stage has to settle, not implement blind: the port number
    (S4), whether a drained row should drop its credential header (the drain markers in
    `tests/clients.rs:1242` and `tests/registry.rs:1052`), and whether JSON-only `/stats` is the
    target shape or a stopgap.
@@ -62,8 +78,8 @@ acceptance letters they cite.
   placeholder, and the sibling typecrate crates already chose the standalone shape
   (`packages/typecrate/harness/Cargo.toml`, `packages/typecrate/services/Cargo.toml`). Consequence:
   **nothing** can use `.workspace = true`, so `edition` (`Cargo.toml:38`), `rust-version` (`:39`),
-  `license` (`:40`), `publish` (`:41`), `[lints.rust]` (`:170-171`) and `[profile.release]`
-  (`:178-183`) are restated literally. A maintainer who "simplifies" one of those into inheritance
+  `license` (`:40`), `publish` (`:41`), `[lints.rust]` (`:229-230`) and `[profile.release]`
+  (`:237-242`) are restated literally. A maintainer who "simplifies" one of those into inheritance
   gets a resolution error, not a cleanup.
 - **Naming is the repo rule.** `rust/README.md:35-45`: `@typecrate/provider` → crate
   `typecrate-provider` (`Cargo.toml:33`) → `typecrate_provider` in code (`Cargo.toml:45`,
@@ -74,10 +90,10 @@ acceptance letters they cite.
 - **The lockfile is a strict subset, on purpose.** This workspace resolves its own `Cargo.lock` and
   the repo has no vendored registry, so a dependency or feature that no sibling resolves needs a
   network fetch that this host does not have. Hence `tracing` with `default-features = false,
-  features = ["std"]` (`Cargo.toml:83`) — dropping the `attributes` feature avoids
+  features = ["std"]` (`Cargo.toml:91-100`) — dropping the `attributes` feature avoids
   `tracing-attributes`, which appears in neither sibling lock — and `axum = "0.8"` with **default
-  features** and no `sse` feature (`Cargo.toml:146`), because the SSE response is
-  `Body::from_stream` + two headers (`serve.rs:567-578`). `tests/transport.rs`'s
+  features** and no `sse` feature (`Cargo.toml:189-205`), because the SSE response is
+  `Body::from_stream` + two headers (`serve.rs:568-579`). `tests/transport.rs`'s
   `the_lock_package_set_is_a_strict_subset_of_the_siblings` fails the moment the set leaks past
   either sibling graph, and
   `tests/transport.rs::axum_sse_response_needs_no_sse_feature` proves the response shape needs nothing
@@ -142,7 +158,7 @@ for tests: a suite builds a `VaultConfig` from a string and a
 `Registry` from rows, while the precedence helper stays a pure function
 (`serve::vault_source_from_values`, `serve.rs:501-511`) instead of a mutation of the process
 environment — which edition 2024 would have made `unsafe` and this crate forbids `unsafe` outright
-(`Cargo.toml:171`). The lazy `OnceLock` state (`serve.rs:414-435`) also installs the registry
+(`Cargo.toml:229-230`). The lazy `OnceLock` state (`serve.rs:414-435`) also installs the registry
 process-wide through `Registry::initialize_process` (`registry.rs:256`), first call wins, so any other
 consumer in the process sees the same rows, counters and rotation cursors.
 
@@ -310,7 +326,7 @@ where the deployed TypeScript answers `unknown`.
 
 ### SSE and JSON: key order is contract
 
-`serde_json`'s `preserve_order` feature (`Cargo.toml:64`) is what lets `serve.rs` state envelope key
+`serde_json`'s `preserve_order` feature (`Cargo.toml:78-81`) is what lets `serve.rs` state envelope key
 order at all: the catalog envelope (`object` then `data`, `serve.rs:900-906`), the stats rows and
 totals (`serve.rs:1050-1106`, `:1111-1161`), and the error frames are compared as bytes downstream, and
 a chunk that is re-serialised on the way to the client must keep its own order (`sse.rs:43-52`). The
@@ -345,12 +361,133 @@ is (`serve.rs:1008-1011`, against TypeScript's `<`/`>` compare at `private-stats
   `serve::ServeState`; taking nothing out of the services state also keeps the handlers plain
   `(state, request) -> Response`, which is what lets `tests/routes.rs` mount them against a synthetic
   registry with no services binary and no artifact on disk.
-- **A real CORS preflight never reaches these handlers** on the services gateway: the gateway layer
+- **A real CORS preflight never reaches these handlers** *on the services gateway*: that gateway layer
   answers it with `204` before routing
   (`packages/typecrate/services/src/server/mod.rs:328-337` explains why the predicate needs
   `Access-Control-Request-Method`, `:386-389` is `is_cors_preflight`, and `:398-405` is the `gateway`
-  layer that returns `StatusCode::NO_CONTENT` at `:402`). A bare `OPTIONS` does, and
-  gets the `400`.
+  layer that returns `StatusCode::NO_CONTENT` at `:402`). A bare `OPTIONS` does, and gets the `400`.
+  The second host does the same thing with **this crate's own copy**: `serve::gateway`
+  (`src/serve.rs:803-809`, predicate `:786-791`, headers `:758-780`) is mounted outermost at
+  `src/bin/server.rs:580`, because a container payload cannot link the services router — see the next
+  section, and the dedup follow-up at the end of this file.
+
+### The standalone host, and pushing it as an anonymous payload
+
+The crate now has two hosts, and the reasoning for the second one is entirely about containers. README
+"Deploying it" carries the operator-facing version; the records here are the ones a later stage must not
+quietly re-litigate.
+
+**Crate side (C6).**
+
+- **A bin even though the rlib already has a host.** A cloud payload is ONE executable in ONE stage
+  directory; pulling `typecrate-services` in would drag its generated route table, its playground
+  builtins and its `/v1/harness` gateway along, and would mean a container running Node or a second
+  binary to serve a provider (`src/bin/server.rs:10-20`). The dependency edge is one-way
+  (`bin → lib`, `:22-27`), so an embedder that runs the route file never starts this executable — the
+  two hosts are alternatives, never stacked.
+- **The credential gate is FAIL-FAST here and SOFT in the library, deliberately.** The library answers
+  503 while the vault is missing (`src/serve.rs`, "the deviation the wire cannot avoid") because it is
+  compiled into a process that also serves `/v1/harness`. A container runner probes by **TCP connect**,
+  so that soft listener would pass readiness while serving nothing but 503s and a bad credential would
+  become a silently-degraded deployment; the bin therefore runs the gate **before the bind** and exits 1
+  with the regeneration command (`src/bin/server.rs:29-42`). `--allow-unconfigured` restores the lazy
+  503 for the cases where booting empty is what the operator asked for. This is the single behaviour the
+  bin *adds* to the contract, and it is why a deploy needs no health endpoint.
+- **Exit codes 0 / 1 / 2, and a hand-built tokio runtime.** The sibling convention
+  (`packages/typecrate/services/src/bin/server.rs:251-254`): a supervisor restarts 2 and fixes 1. `main`
+  builds the runtime by hand and calls `std::process::exit` because
+  `[profile.release] panic = "abort"` would otherwise turn a `main -> Result` into an abort status
+  instead of the promised code (`src/bin/server.rs:44-50`). An unparseable `PORT` or
+  `TYPECRATE_PROVIDER_HOST` counts as **usage** (2), not a server fault: it is an operator-typed value
+  (`:119-121`).
+- **Default bind is `0.0.0.0`, not the harness bin's `127.0.0.1`** — a container has no client on
+  loopback; the probe and the caller both arrive on an interface address (`:96-99`).
+- **`GET /health` is bin-only on purpose** (`:109-112`): it is not one of `serve`'s four contract
+  routes, and a fifth path constant in the library would change what `packages/typecrate/services`
+  **lists** for this package. Consequence an operator has to know: on a Modal box the runner's own routes
+  shadow the service's at `/`, `/health`, `/tools`, `/stats`, `/status`, `/logs`
+  (`services/modal/deploy/sandbox/modal-sandbox-container.py:300`), so that path is not a reliable probe
+  of *this* payload through a box.
+- **The `tracing` subscriber is hand-written** over `tracing` + `tracing-core`
+  (`src/bin/server.rs:64-76`), because `tracing-subscriber` is in no typecrate lockfile and adding it
+  would break `tests/transport.rs::the_lock_package_set_is_a_strict_subset_of_the_siblings` — the same
+  pressure that keeps axum feature-default (S7). Without a subscriber, `tracing`'s `NoSubscriber`
+  answers `enabled(..)` with `false` and the crate's token/failover/retry lines are thrown away.
+- **`pub(crate)` in a binary, and a `#[path]` include from `tests/bin_server.rs`.** Flag/environment
+  precedence, the gate, the banner labels and the log filter are pure functions so the test target can
+  assert them directly; edition 2024 makes `std::env::set_var` unsafe and this crate forbids `unsafe`
+  outright, so a test feeds values to the resolver rather than mutating the process environment
+  (`src/bin/server.rs:52-62`, the sibling precedent at
+  `packages/typecrate/harness/src/bin/server.rs:527-539`).
+
+**Verb side (C7) — what the payload is, and why it is anonymous.**
+
+- **No `x-runtime-profile` header at all**, i.e. the container's `generic` profile
+  (`services/daytona/sandbox/runtime-lib.mjs:75-96`): the allowed config keys are exactly
+  `runCmd, port, probePath, probeTimeoutSec, stopSignal, buildCmd, buildTimeoutSec, artifactPath, env`,
+  the defaults are `port 8080` / `SIGTERM` / `60 s`, and the profile adds no key, no signature and no
+  registry lookup. A tar.gz **must** name `runCmd`, because an archive can hold anything and the runner
+  refuses to exec blind (`runtime-lib.mjs:85-87`; the client validates it too).
+- **`probePath` is omitted, and that absence is the payload's readiness contract** — no `probePath`
+  means a bare TCP connect (`runtime-lib.mjs:82-84`), the only rule that assumes nothing about what is
+  running. `--probe-path /health` is offered because the bin really does serve it, but on a box it would
+  be answered by the **runner** (the shadowing bullet above), so the default is the honest one.
+- **Credentials are a bundle member, never a `config.env` value.** `GET /status` echoes the posted
+  config **verbatim** to a caller that presented no secret (`runtime-lib.mjs:90-93`), and the box has no
+  authentication layer of its own (`modal-sandbox-container.py:301-306`: "anyone holding the URL can
+  POST code"). So the anonymity is bidirectional — the container does not know what it runs, and it does
+  not authenticate the caller — and the payload's authentication is therefore its own business: the
+  vault document rides inside the tar.gz and `env` carries only `TYPECRATE_PROVIDER_VAULT_PATH` as a
+  **relative** path (`./agentic-provider.json`, resolved against the runner's stage dir, which is the
+  child's cwd — `src/bin/server.rs:156-158`).
+- **`port: 8800` is a contract, not a preference.** The runner forces `PORT` to the declared
+  `config.port` in the child environment (`services/daytona/sandbox/runtime-server.mjs:438`
+  `childEnv`, `modal-sandbox-container.py:1895-1899` `_child_env`) and `config.env` outranks that
+  injection, so `--env PORT=9100` with `--port 8800` boots a server the probe is not watching — hence
+  `portCollisionNotes` (`scripts/deploy-endpoint.ts:446-450`) rather than a silent footgun.
+- **`stopSignal: SIGTERM` is safe because the bin drains.** SIGTERM/SIGINT/Ctrl+C stop it after
+  in-flight requests finish, with exit 0 (`src/bin/server.rs:186-188`); an anonymous payload's default
+  stop signal is SIGTERM precisely because a stranger cannot be assumed to have nexus's worker-pool
+  shutdown (`runtime-lib.mjs:88-89`).
+- **The endpoint is an argument, never a package constant.** `start:modal` resolves
+  `--endpoint`/positional > `TYPECRATE_PROVIDER_ENDPOINT` > `@config/vault` `modalContainer`, while
+  nexus's `start-modal.ts:25-26` pins the vault value with no override. The reason is concrete: the box
+  this repo owns (`config/vault/src/container/modal-container.ts:1-3`) is occupied by another workload
+  and one runner holds one payload slot, so a deploy here either displaces that workload or fails — and a
+  second box has its own `https://<source>--<BOX_LABEL>.modal.run`
+  (`modal-sandbox-container.py:4540-4544` `BOX_LABEL`). The wrapper prints which source won, for the same reason.
+- **Every side effect is injected, and importing a verb starts nothing.** The verbs are pure functions
+  over `ProviderDeps`/`DaytonaDeps` (`scripts/deploy-endpoint.ts:482-486`,
+  `scripts/start-daytona.ts:216-221`), mirroring the client's own `RuntimeDeps` discipline, so
+  `vitest` drives all three with no network, no cargo and no Daytona call (86 tests). The entry detector
+  lives in `scripts/entry-guard.ts` because **three** files are entry points and two of them import the
+  third: nexus's equivalent has no guard, so importing `nexus/scripts/start-modal.ts` performs a deploy
+  (`start-modal.ts:25-26`) — a shape that would make this package's own test suite deploy twice.
+- **A dry run also skips cargo.** The client's dry-run posture sends nothing
+  (`services/daytona/sandbox/runtime-deploy.ts:1777-1787`); this verb additionally passes
+  `noBuild: flags.noBuild || flags.dryRun` (`scripts/deploy-endpoint.ts:549-563`) so the flag works on a
+  host with no registry access at all — the artifact must already exist, which is what makes the offline
+  claim checkable rather than aspirational.
+- **Daytona needs its own verb because of a two-port rule.** `createSandbox({ port })` mints the
+  preview link of the **runner's** port (`services/daytona/sandbox/setup-sandbox.ts:234`, `:1447`), which
+  is the management endpoint; the **provider's** URL is a second link, minted after the deploy with
+  `getPreviewLink(<payload port>)`, and its token is not derivable from anything the runner says
+  (`runtime-deploy.ts:1580-1591` reports `publicUrl: null` on Daytona by construction). Lifecycle is the
+  caller's: never delete on success, delete on a failed deploy unless `--keep-on-fail`, and
+  `createSandbox` already deletes its own half-built machine
+  (`setup-sandbox.ts:1553-1563`).
+- **One machine-readable last line, on every path.** Human output is prefixed `[provider:deploy]`; the
+  final line is a bare JSON object (`buildSummary`, `runtime-deploy.ts:1600-1631`), so `tail -1 | jq`
+  works for a deploy, a teardown, a dry run and a Daytona create alike. `start:daytona` prints its **own**
+  summary last because the client's shape has no room for `sandboxId` or the minted link, and its
+  `publicUrl` is null by construction.
+- **The npm layer is cargo-only no longer, and the docs had to move with it.** `package.json` gained
+  `dependencies` (`@config/vault`, `@services/daytona`) and the `#layout` / `#rust` notes that used to
+  say "owns no listener of its own" and "no verb needs a vite-node pre-step" now say which half of that
+  is still true. The deps are runtime-time for the scripts only — `cargo test` never imports them — which
+  is the distinction `.github/workflows/ci.yml` states explicitly, rather than claiming no npm
+  dependency exists.
+
 
 ## Deviation records — the reasoning README's table cannot hold
 
@@ -417,23 +554,29 @@ additions appear in `totals` only (`serve.rs:1151-1158`). Nothing else is surfac
 The approved scope is a **behavioural test core, not 1:1 parity** with the TypeScript suite. Counted on
 this pass: the TypeScript side is 35 `*.test.ts` files under `packages/agentic/provider/src` with 294
 declared cases, plus 8 route-side test files under `runtime/endpoint/provider/**`; the Rust side is
-146 test functions (33 lib unit + 113 integration across 5 targets) **plus 2 doc tests**, and
-`cargo test --offline --locked` run on this pass (2026-11-19, re-run after the micro-pass added
-`sse::tests::the_sentinel_prefix_ends_the_stream_even_with_text_after_it`) reported exactly that:
-**148 passed, 0 failed, 0 ignored** (33 lib / 15 accounting / 27 clients / 12 registry /
-18 routes / 41 transport / 2 doc tests), exit 0 — so the "146 vs 148" question is the doctest
-target, not a missing test. The doctests are the runnable examples in
-`src/vault.rs:900` (`load_from_str`) and `src/transport.rs:1677` (`prepare_body`) — the two
-lines `cargo test --doc` names. `fmt`, `check` and `clippy -- -D warnings` were also re-run on
-this pass and are clean. The per-target breakdown and the gap list are in README's
-[Test parity and coverage](README.md#test-parity-and-coverage).
+**173 test functions** (33 lib unit + 140 integration across **7** targets) **plus 2 doc tests**, and
+`cargo test --workspace --locked` re-run on this pass (2026-11-19, after the `[[bin]]` and gateway
+targets were added) reported exactly that: **175 passed, 0 failed, 0 ignored** (33 lib / 0 bin unit /
+15 accounting / **19 bin_server** / 27 clients / **8 gateway** / 12 registry / 18 routes / 41 transport /
+2 doc tests), exit 0 — so the "173 vs 175" question is the doctest target, not a missing test. The
+doctests are the runnable examples in `src/vault.rs:900` (`load_from_str`) and
+`src/transport.rs:1677` (`prepare_body`) — the two lines `cargo test --doc` names. `fmt`, `check` and
+`clippy -- -D warnings` were re-run on this pass too and are clean. The per-target breakdown and the gap
+list are in README's [Test parity and coverage](README.md#test-parity-and-coverage).
 
 The suite is organised around the acceptance letters recorded in `tests/registry.rs:3-16` (A4–A9), and
 its discipline is that every expectation is read out of a TypeScript or Rust source **before** the code
 ran (`tests/routes.rs:5-8`), against a real in-process listener rather than a mock
-(`tests/transport.rs:3-8`). It does not dial a live upstream, does not run inside the services binary,
-and does not exercise Daytona, Lightning, the HTML dashboard, stats persistence or per-row request
-shapes for all 29 rows.
+(`tests/transport.rs:3-8`). The two new targets extend that discipline rather than break it:
+`tests/bin_server.rs` and `tests/gateway.rs` drive the **bin's own router on a real socket**, so the
+fail-fast gate, the `/health` body, the `ANY` refusals and the preflight `204` are wire facts, not
+assertions about a hand-built `Next`. Still not covered, and stated so nobody over-reads the 175: no live
+upstream, no run inside the `typecrate-services` binary (the route-file half is still pinned by literals
+and by services' own tests), no `POST /` to a live Modal box or Daytona sandbox, no Daytona or Lightning
+**rows** (they are absent, not exercised), no HTML dashboard, no stats persistence, and not all 29 rows
+exercised individually. The npm verbs are covered separately, by
+`yarn vitest run packages/typecrate/provider/scripts` — 86 tests with every side effect injected, so
+they need neither network nor cargo.
 
 Two pre-existing TypeScript failures are recorded so nobody files them as port regressions:
 `packages/agentic/provider/src/local/local-basalt.test.ts:51` and `:71` assert zero costs while the
@@ -466,11 +609,39 @@ TypeScript-side camelCase members verified separately, or numbers that are not l
 | 8 | a cite worth keeping: `serve.rs` and `provider-route.rs` cite `start.ts:780` for "one listener per distinct declared port" | `start.ts:777-781` is exactly the port-grouping phase | unchanged — re-verified, no edit |
 | 9 | the `RoutingVendor` doc listed eight `merge/merge-*.ts` call sites and then said "the **seven** names are the complete set" | eight call sites, **five** distinct vendors (`telnyx`, `pareto`, `modal`, `deepinfra`, `openai`) — which is why the enum has five variants | `src/lib.rs:17` ("eight `vendor:` injections (five distinct values)") and the `RoutingVendor` doc in `src/client.rs` |
 | 10 | `error.rs` cited `start.ts:319-327` for `STREAM_ERROR_CODES` | the doc comment is `:317`, the `as const` array `:318-326` (the six codes `:319-325`), and `:327` is the `StreamErrorCode` alias | `src/error.rs:6` and `:83` |
-| 11 | `package.json`'s metadata prose predated the crate: "NO [lib] bin yet", "axum/reqwest are NOT declared", "PORTED TODAY: `src/vault.rs`" | the route bridge exists and is mounted by `packages/typecrate/services`; axum and reqwest are declared; the transport, clients, registry and routes all exist — and the scripts carry `--locked` but **never** `--offline` | `package.json` was rewritten on this pass: `#layout`, `#rust`, `#locked`, `#scope` and `#artifact` now describe what ships, and `#rust`/`#locked` state that `--offline` is per-invocation, matching the sibling crates |
+| 12 | drift this pass found in its **own** documents and scripts, after the `[[bin]]` and the deploy verbs landed: `package.json` `#layout` "owns no listener of its own", `#rust` "no vite-node pre-step", `README.md`/`knowledge.md` still describing a crate with no process of its own (a "no `[[bin]]`" / "served only by the services router" shape) and stale test totals (**137** and **148**), `.github/workflows/ci.yml:11-14` "the crate has no npm dependencies", and three drifted cites in `scripts/` | the crate owns a listener and has two hosts (bin / route file); the cargo verbs need no pre-step but the three deploy verbs are `vite-node`; the totals are **175** (173 + 2 doctests, per the run recorded under README "Verification"); the crate still has no npm dependencies, but **the package now does** (`@config/vault`, `@services/daytona`, for the scripts only); `runtime-lib.mjs:88-90` is really the `probePath` bullet of the `generic` profile's defaults doc (`runtime-lib.mjs:82-84` as this row is re-pointed today — the TCP-readiness rule, not a function); `modal-sandbox-container.py:1835` is really `:1895-1899`, the child-env builder — named `_runtime_env` when this row was first written and renamed `_child_env` since — and `:4362` is really `:4540-4544`, the `BOX_LABEL` assignment with the comment that says why it is env-overridable. Both numbers are **spans as of this re-pointing, not permanent**: those two read-only files are being edited by other work in this same session, which is why every pointer here names the symbol (grep `probePath`, `_child_env`, `BOX_LABEL`) rather than trusting a bare number | `README.md` ("What ships", "Deploying it — the three verbs", "Getting a dedicated box", the test table, "Verification", "Two implementations"), `knowledge.md` (port map items 6-7, the route-bridge bullet, the new host/payload section, the parity counts), `package.json` (`#layout`, `#rust`, `#deploy`, `#ts`, `#dependencies`), `package.json` `#artifact`, `.github/workflows/ci.yml` (the header now states what CI runs and what it deliberately cannot), and the three script cites — which now name the **function** as well as the line, so the next renumbering of a file this task only reads is visible instead of silent |
+
+| 13 | the same drift, one pass later, and this time inside **this package's own test and doc history**: the `create opts` bullet of `scripts/start-daytona.test.ts` (the cite sits at `:14` today) cited `setup-sandbox.ts:1565-1590`, the `summary` bullet (the cite sits at `:30` today) cited `runtime-deploy.ts:1579-1591` (both bodies had moved again), the same file's cargo comment (now `:387`) cited `runtime-deploy.ts:874-899`, row 12's own "really" numbers had been overtaken by the same churn, and README's closing drift note cited `scripts/deploy-endpoint.ts:154` and `:437`. Separately: the two `--out` tests asserted `resolve('Temp/out.tar.gz')`, which **cannot fail** — vitest's cwd is the repo root, so the buggy cwd answer and the correct repo-root answer are the same string | `createSandbox` is `setup-sandbox.ts:1565-1587` (the whole arrow, `};` at `:1587`; the `:1586` reported a pass earlier is the `};` that closes the **returned object**), `buildPublicUrl` is `runtime-deploy.ts:1579-1587`, `cargoArtifactCandidates` is `runtime-deploy.ts:874-898` (doc `:874-880` + body `:881-898`), and `RUNNER_PORT` is still `setup-sandbox.ts:234`; the two provider-script comments are `deploy-endpoint.ts:150-157` (`DEFAULT_PORT`) and `:438-445` (`portCollisionNotes`), and the start-modal comment is `start-modal.ts:27-30`; `_child_env` is `:1895-1899` and `BOX_LABEL` `:4540-4544` — so the production scripts' own cites (`:1894-1898`, `:4539-4543`) are now one line low, left for a pass that may write `scripts/*.ts`; the vitest totals are **86** (83 + 3 new `resolveOutPath` tests), proven against the bug by flipping `join(repoRoot, value)` back to `resolve(value)`: 5 tests fail with received `packages/typecrate/provider/Temp/out.tar.gz`, and the implementation was restored byte-identically (sha256 `2b0f2fd6…a8c6`) | `scripts/start-daytona.test.ts` (the two header cites and the cargo comment, each now naming `createSandbox` / `buildPublicUrl` / `cargoArtifactCandidates`), `scripts/deploy-endpoint.test.ts` (a `describe('resolveOutPath')` block and a `withCwd` fake — the `--out` flow tests now assert the literal `join(REPO_ROOT, …)` while the cwd is faked to the PACKAGE root, which is where `yarn workspace @typecrate/provider deploy:endpoint` actually starts), `README.md` (the `_child_env` span, the **86** totals, the closing drift note re-pointed at the declarations), and `knowledge.md` (the two port-map bullets, the two vitest totals, row 12 above, and this row) |
 
 Two things this pass deliberately did **not** claim: the retry budget (row `transport.rs:77`/`:80` in
 README's deviation table) and the SSE decoder's three one-directional leniencies (`sse.rs:54-80`) are
 deviations, not citation errors, and they are recorded as such in README rather than "fixed" here.
+
+## Follow-ups this pass recorded and did not take
+
+Two pieces of work that this change **made visible** and deliberately left undone, because each edits a
+crate or a package outside `packages/typecrate/provider`:
+
+1. **Deduplicate the gateway layer: `packages/typecrate/services/src/server/mod.rs:354-417`.** That
+   block holds `PRIVATE_NETWORK_ALLOW_HEADER`, the `*` allow-set, `is_cors_preflight` and the preflight
+   `204` layer as **private** items of the services router; `src/serve.rs:747-809` now publishes the same
+   behaviour as `PRIVATE_NETWORK_ALLOW_HEADER` (`:747`), `GATEWAY_ALLOW_ALL` (`:753`),
+   `with_gateway_headers` (`:758`), `is_cors_preflight` (`:786`) and `gateway` (`:803`), because a
+   container payload cannot link the services router and `src/bin/server.rs:580` is the second consumer.
+   Two copies of a wire policy is the thing most likely to drift — the services side pins it in
+   `packages/typecrate/services/tests/server_http.rs`, and this crate pins its own copy in
+   `tests/gateway.rs` — so services should call `typecrate_provider::serve::gateway` instead of its
+   private duplicate. Not taken here: it edits the services crate **and** its `tests/server_http.rs`
+   pins, and the two suites agree today. `tests/gateway.rs:1-13` records the same decision from the test
+   side.
+2. **Retarget nexus's scripts onto the same `runtime-deploy` client.** `packages/typecrate/nexus/scripts/`
+   still owns a whole profile system, a hub-URL story and its own `deploy-daytona.ts` shell-out
+   (`start-modal.ts:25-27` also has no entry guard, so importing that module performs a deploy). This
+   package consumed the client instead of duplicating it, so the duplication now sits on the nexus side:
+   its verbs could call `cargoReleaseBin` / `packagePayload` / `deployPayload` / `probeEndpoint` and keep
+   only its hub-specific payload declaration. Not taken here: nexus's payload is a different workload
+   (profile-bearing, port 8085, `SIGINT`), its tests are its acceptance surface, and no behaviour this
+   task owns depends on the change.
 
 ## Cutover: what the vault side needs when this crate becomes the consumer
 
@@ -523,7 +694,7 @@ loud, but only at first request.
   `client.rs:68-70`).
 - **Exactly-once settlement** across exhaustion, failure, cancellation and abandonment
   (`transport.rs:102-112`).
-- **`Cargo.lock` stays a subset** and axum stays feature-default (`Cargo.toml:146`), or the sibling
+- **`Cargo.lock` stays a subset** and axum stays feature-default (`Cargo.toml:189-205`), or the sibling
   service build and the offline build both move.
 - The **no-`charset` JSON content type** and the two SSE headers, byte for byte
   (`serve.rs:227-235`, pinned by `tests/routes.rs`).
@@ -531,6 +702,24 @@ loud, but only at first request.
   the two suite-level leak tests (`vault.rs:153-164`, `client.rs:1024-1059`, `error.rs:62-69`,
   `tests/transport.rs::no_credential_reaches_a_diagnostic_or_the_wire_detail`,
   `tests/clients.rs::no_credential_value_reaches_the_failure_vocabulary_or_the_debug_output`).
+- **The bin's credential gate stays BEFORE the bind** (`src/bin/server.rs:29-42`). Restoring the
+  library's lazy 503 there turns a refused vault into a listener that passes a TCP-connect readiness
+  probe while serving nothing but 503s — a deploy that reports success and is broken. `--allow-unconfigured`
+  is the explicit way to want the soft behaviour.
+- **`/health` stays bin-only** (`src/bin/server.rs:109-112`): a fifth path constant in `src/serve.rs`
+  changes what `packages/typecrate/services` lists for this package, and the services mount must keep
+  answering exactly the four contract routes.
+- **The payload stays exactly two members, with those modes** — `typecrate-provider-server` 0755 (the
+  runner execs `./<member>`, so the exec bit is not cosmetic) and `agentic-provider.json` 0644 — with
+  **no `probePath`** unless an operator opts in, and **no secret in `config.env`**, because the container's
+  `GET /status` echoes the posted config to callers that presented no secret
+  (`services/daytona/sandbox/runtime-lib.mjs:90-93`). `scripts/deploy-endpoint.test.ts` pins the member
+  table and the config key-for-key; loosening any of those assertions is the regression.
+- **Importing a deploy verb must start nothing** (`scripts/entry-guard.ts`). nexus's `start-modal.ts` is
+  the counter-example (`:24-27`); under `vitest` the guard must win first, or the package's own test suite
+  deploys.
+- **The endpoint stays a parameter** (argument > `TYPECRATE_PROVIDER_ENDPOINT` > vault): baking a box URL
+  into the package re-couples this workload to a single shared box that another workload already occupies.
 
 ## Staleness in the Rust top-level docs (reported, not edited)
 

@@ -45,14 +45,31 @@ description = "Rust-native private model provider for @typecrate/provider: the v
 name = "typecrate_provider"                 # in Rust code: `use typecrate_provider::...`
 path = "src/lib.rs"
 # rlib -> the shape `packages/typecrate/services` links against when it discovers a
-# `*-route.rs` file from this package (that wiring is a later task).
+# `*-route.rs` file from this package (that wiring has since landed, as
+# `endpoint/provider/provider-route.rs`).
 crate-type = ["rlib"]
 
-# No `[[bin]]` yet, on purpose: the port starts with the vault artifact loader, and
-# whether the crate ships its own listener or is only linked into
-# packages/typecrate/services is decided by the route task. Adding a bin later is one
-# explicit `[[bin]]` table here (never cargo autodiscovery - see the siblings' comments
-# on why an explicit table keeps the artifact name stable and greppable).
+# The crate's OWN listener. This table is exactly the one the comment block that used to
+# sit here pre-authorized ("Adding a bin later is one explicit `[[bin]]` table here"), and
+# the condition it deferred on - the route task - has landed.
+#
+# WHY A BIN AT ALL: the deploy shape is a cloud container (modal / daytona / any OCI
+# runner) that gets ONE self-contained executable and no Node runtime. The rlib is the
+# host `packages/typecrate/services` links into its own multi-listener gateway; this bin is
+# the host that has no gateway, so the provider can be pushed and served on its own socket.
+# Neither links the other - the bin is a process wrapper over `src/serve.rs`, the same way
+# `packages/typecrate/harness/src/bin/server.rs` is a wrapper over `harness/src/server.rs`.
+#
+# WHY THE TABLE IS EXPLICIT (the siblings' reason, restated): cargo would otherwise
+# autodiscover `src/bin/server.rs` and name the executable `server`. The explicit table pins
+# the artifact name, which is what a deploy script and a container entrypoint have to name.
+# Adding it here does NOT make this file a route source: services' discovery
+# (`packages/typecrate/services/build_support/discovery.rs:196-198`) only walks
+# `endpoint/`/`endpoints/` trees, so `src/bin/server.rs` contributes no route and cannot
+# move `services/src/server/mod.rs`'s `declared_ports()` table.
+[[bin]]
+name = "typecrate-provider-server"
+path = "src/bin/server.rs"
 
 [dependencies]
 # Derives for the vault document in src/vault.rs. `derive` is the only feature needed:
@@ -81,6 +98,26 @@ thiserror = "2"
 # (there is no vendored registry here). A task that wants `#[instrument]` re-adds the
 # feature in its own wave.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# Declared directly for the SAME reason `packages/typecrate/services/Cargo.toml` declares it:
+# `src/bin/server.rs` IMPLEMENTS the subscriber trait, and `Subscriber`, `Event`, `Metadata`,
+# `Level`, `LevelFilter`, `span::*` and `field::Visit` are `tracing-core` items that `tracing`
+# only re-exports. Naming the crate keeps the bin's implementation resolvable if a future
+# `tracing` reshuffles its re-export list.
+#
+# "It adds no crate" is TRUE of the PACKAGE set - `tracing` already resolves `tracing-core`
+# 0.1.36 here, so no new package appears - but it is NOT a statement about the lockfile as a
+# whole: the line below adds a dependency EDGE to the `typecrate-provider` entry of every
+# lockfile that resolves this crate. Siblings link it BY PATH
+# (`packages/typecrate/services/Cargo.toml:92`), so a DIRECT dependency on a crate that is
+# already resolved still means regenerating the CONSUMER lockfiles. That is exactly how
+# `packages/typecrate/services/Cargo.lock` went stale here: its `--locked` gate failed until
+# one `+ "tracing-core",` line was added to its `typecrate-provider` entry. A sibling's
+# `cargo check --locked` is what catches this, and it has to run in the SIBLING - this
+# package's own `--locked` gate cannot see a consumer's lockfile.
+# `tracing-subscriber` is the dependency that would add CRATES (matchers / nu-ansi-term /
+# sharded-slab / thread_local / …), and it appears in NEITHER sibling lockfile - which is why
+# the bin's subscriber is hand-written off these two.
+tracing-core = { version = "0.1", default-features = false, features = ["std"] }
 
 # ── The transport substrate (src/transport.rs) ───────────────────────────────
 # Every line below is byte-identical to the declaration in packages/typecrate/harness
@@ -100,13 +137,35 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "rustls-tls",
 ] }
-# `time` ONLY, on purpose: the transport needs `tokio::time::timeout` (the 30-minute
-# ceiling) and `tokio::time::sleep` (the 429 pause). The multi-thread runtime, `net`
-# and `macros` arrive through axum below - in the NORMAL graph since `serve` landed, and
-# before that only through the axum dev-dependency - and the binaries that need a
-# multi-thread runtime add those features in their own wave (services declares its own
-# set). Stated as `["time"]` anyway because that is the harness's declaration verbatim.
-tokio = { version = "1", features = ["time"] }
+# `time` was the whole list while this crate had no listener of its own: the transport needs
+# `tokio::time::timeout` (the 30-minute ceiling) and `tokio::time::sleep` (the 429 pause), and
+# nothing in the rlib binds a socket. `src/bin/server.rs` does, so the features that listener
+# needs are added HERE, in this wave, exactly as the comment sitting on this line pre-authorized
+# ("the binaries that need a multi-thread runtime add those features in their own wave
+# (services declares its own set)").
+#
+# The set is `packages/typecrate/services/Cargo.toml:71` minus `sync`: services needs
+# `tokio::sync` for its multi-listener shutdown channel and this bin has one listener and one
+# `select!`, so it does not ask for what it does not use.
+#
+# NOT `full`, and that stays load-bearing for the offline rule above: tokio's `full` turns on
+# its optional `parking_lot` dependency, and `parking_lot`/`lock_api`/`parking_lot_core`/
+# `redox_syscall`/`scopeguard` are in ../harness/Cargo.lock but NOT in ../services/Cargo.lock,
+# so `full` would push five packages past the services graph and fail
+# `tests/transport.rs::the_lock_package_set_is_a_strict_subset_of_the_siblings`.
+#
+# `signal` is what `tokio::signal::ctrl_c` and `tokio::signal::unix::signal(SIGTERM)` need, and
+# it is the one feature here that changes the lockfile: it adds `signal-hook-registry` and its
+# `errno`, both already pinned identically in BOTH sibling lockfiles
+# (`signal-hook-registry 1.4.8`, `errno 0.3.14`), so the package-set subset still holds and an
+# offline build seeded from either sibling still resolves.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "signal",
+] }
 # `CancellationToken` for cancel safety (src/transport.rs): the caller's signal stops a
 # request before the head arrives, and dropping a stream cancels the upstream read.
 # `tokio_util::sync` is NOT feature-gated, so the feature list below is the harness's own

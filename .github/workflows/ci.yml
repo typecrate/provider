@@ -10,8 +10,36 @@
 #
 # WHAT RUNS: `npm test`, the package's declared test entry point
 # (`package.json` -> `cargo test --workspace --locked`), so CI runs exactly what
-# a developer runs locally. No npm dependency needs installing: the crate has no
-# npm dependencies and resolves its Rust graph from the committed Cargo.lock.
+# a developer runs locally. SCOPE OF THE "NO INSTALL" CLAIM: the CRATE has no npm
+# dependencies and resolves its Rust graph from the committed Cargo.lock, and no
+# cargo test imports an npm package, so nothing needs installing FOR THIS JOB.
+# `package.json` does now declare dependencies (`@config/vault`,
+# `@services/daytona`) — they belong to the TypeScript deploy verbs
+# (`scripts/deploy-endpoint.ts` / `start-modal.ts` / `start-daytona.ts`, run by
+# `deploy:endpoint` / `start:modal` / `start:daytona`), plus `typecheck` and
+# `test:scripts`. The remaining verbs (`check` / `test` / `lint` / `lint:strict`
+# / `fmt` / `fmt:check` / `build` / `build:server` / `start:server`) stay plain
+# cargo, which is what this workflow runs.
+#
+# WHY CI DOES NOT ALSO RUN THOSE FIVE (the honest option, and the reason it is
+# stated rather than hidden): they cannot resolve in a standalone checkout of
+# THIS repository. `@config/vault` and `@services/daytona` are workspace packages
+# of the noobscript monorepo, shipped as TypeScript sources (no build step), and
+# `tsconfig.json` extends `../../../tsconfig.json` — three levels ABOVE this
+# repository's root. Making CI typecheck and unit-test the scripts would mean
+# checking out noobscript, config/vault and services/daytona at the right
+# relative paths and installing the hoisted toolchain (vite-node, vitest,
+# typescript, eslint) on top. That is a monorepo job, so it runs in the monorepo:
+# `yarn tsc --noEmit -p packages/typecrate/provider` and
+# `yarn vitest run packages/typecrate/provider/scripts` (both recorded in
+# README "Verification" and in `package.json` `#ts`). A `provider/package.json`
+# script could not express either one without a path outside this repository.
+#
+# TARGET DIR: the cache below names `packages/typecrate/provider/target`, NOT the
+# `.rust/target` the monorepo uses, because the file that sets `target-dir`
+# (`noobscript/.cargo/config.toml`) lives three levels above this checkout and is
+# not part of it. Here, cargo uses its default `<package>/target`. Do not
+# "correct" this path to `.rust/target`.
 #
 # SIBLING CHECKOUTS: `tests/transport.rs::the_lock_package_set_is_a_strict_subset_of_the_siblings`
 # reads `../harness/Cargo.lock` and `../services/Cargo.lock` to prove every
@@ -57,6 +85,10 @@ jobs:
                   repository: typecrate/services
                   path: packages/typecrate/services
 
+            # Node is installed because `npm test` is the entry point this job runs
+            # (npm/yarn is the process that executes the `test` script, and that script
+            # is cargo). No `npm install` step exists and none is needed: the script
+            # invokes no npm package. See the header, "SCOPE OF THE \"NO INSTALL\" CLAIM".
             - name: Setup Node
               uses: actions/setup-node@v5
               with:

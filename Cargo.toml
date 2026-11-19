@@ -1,0 +1,183 @@
+# =============================================================================
+# typecrate-provider - the Rust core behind the `@typecrate/provider` npm package.
+#
+# WHY an explicit `[workspace]` table HERE (and not a crate under root `rust/crates`):
+# the package was requested at packages/typecrate/provider, and the root workspace
+# (../../../Cargo.toml) only globs `members = ["rust/crates/*"]`. Without a
+# `[workspace]` boundary cargo walks up, finds the root workspace, and fails with
+# "current package believes it's in a workspace when it's not". Declaring the
+# boundary here keeps the requested npm location and leaves the root workspace
+# untouched - the same shape packages/typecrate/harness and
+# packages/typecrate/services already use (read either file's header comment).
+#
+# What is still inherited from the repo root (cargo config discovery walks up from
+# the cwd, independently of workspace membership - see ../../../.cargo/config.toml):
+#   target-dir = ".rust/target"          -> artifacts stay inside the repo
+#   [env] TMP/TEMP/TMPDIR = Temp/rust    -> child processes never touch OS temp
+#   rust-toolchain.toml channel 1.99.1   -> pinned toolchain
+#
+# Because this crate is NOT a member of the root workspace, it cannot use
+# `.workspace = true` inheritance for ANY of the values below: every one of them is
+# restated literally, and `[lints.*]` + `[profile.release]` are restated too.
+#
+# Native-only: like its siblings this crate is an HTTP server, so there is no wasm
+# boundary and no target gating.
+# =============================================================================
+
+[workspace]
+# 3 = the edition-2024 default (matches the root workspace and both siblings):
+# per-target feature resolution.
+resolver = "3"
+
+[package]
+name = "typecrate-provider"
+# Crate name == npm name with `@` dropped and `/` replaced by `-`
+# (naming rule in ../../../rust/README.md "Name mapping rule"):
+# `@typecrate/provider` -> crate `typecrate-provider`, in Rust `typecrate_provider`.
+version = "1.0.2"           # mirrors the npm line in package.json (both pinned together)
+edition = "2024"            # literal: workspace inheritance is unavailable here
+rust-version = "1.99"       # same floor as the root workspace
+license = "MIT"             # matches the root workspace and both typecrate siblings
+publish = false             # crates.io: consumed by path, not published
+description = "Rust-native private model provider for @typecrate/provider: the vault-backed credential/endpoint substrate and the OpenAI-compatible model clients ported from @agentic/provider."
+
+[lib]
+name = "typecrate_provider"                 # in Rust code: `use typecrate_provider::...`
+path = "src/lib.rs"
+# rlib -> the shape `packages/typecrate/services` links against when it discovers a
+# `*-route.rs` file from this package (that wiring is a later task).
+crate-type = ["rlib"]
+
+# No `[[bin]]` yet, on purpose: the port starts with the vault artifact loader, and
+# whether the crate ships its own listener or is only linked into
+# packages/typecrate/services is decided by the route task. Adding a bin later is one
+# explicit `[[bin]]` table here (never cargo autodiscovery - see the siblings' comments
+# on why an explicit table keeps the artifact name stable and greppable).
+
+[dependencies]
+# Derives for the vault document in src/vault.rs. `derive` is the only feature needed:
+# the artifact is plain serde_json, no formats, no attribute macros beyond the derives.
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` keeps a JSON document's own key order, so a counterfactual document
+# built by re-serialising a parsed artifact stays byte-comparable (and so does any
+# future `--check`-style re-emit). Same feature the harness crate declares.
+serde_json = { version = "1", features = ["preserve_order"] }
+# The one refusal type every layer maps into (`src/vault.rs::VaultError`). Version
+# pinned to what the sibling lockfiles already resolve (thiserror 2.0.21), because this
+# standalone workspace has no vendored registry: anything not already in a sibling
+# Cargo.lock would need a network fetch.
+thiserror = "2"
+# Diagnostics for the loader (`tracing::trace!` on the accepted-document path, counts
+# only - never a value). Declared now because the transport/client tasks log through the
+# same facade; the version is the one the sibling graphs already resolve (0.1.44).
+#
+# `default-features = false, features = ["std"]` is deliberate and load-bearing for
+# offline builds: tracing's DEFAULT feature set includes `attributes`, which is the only
+# thing that pulls `tracing-attributes` - a crate that appears in NEITHER sibling lockfile
+# (axum and tokio ask for tracing with `default-features = false`, which is why the
+# siblings resolve 0.1.44 without it). Dropping it keeps this crate's whole dependency
+# graph a strict SUBSET of packages/typecrate/{harness,services}/Cargo.lock, so a checkout
+# whose cargo cache was seeded only by those two builds still resolves every crate offline
+# (there is no vendored registry here). A task that wants `#[instrument]` re-adds the
+# feature in its own wave.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# ── The transport substrate (src/transport.rs) ───────────────────────────────
+# Every line below is byte-identical to the declaration in packages/typecrate/harness
+# (the only in-repo precedent for outbound OpenAI-compatible HTTP/SSE), and that is
+# deliberate: this standalone workspace resolves its OWN Cargo.lock with no vendored
+# registry, so a feature set that differs from a sibling's can resolve a package the
+# cargo cache has never downloaded and break an offline build. The package set of this
+# lockfile is therefore kept a STRICT SUBSET of ../harness/Cargo.lock and
+# ../services/Cargo.lock (`cargo check --offline` proves it, and tests/transport.rs
+# has a test that diffs the two package-name sets).
+#
+# The provider CLIENT (the outbound half): {base}/chat/completions and {base}/responses
+# over HTTP/1.1, plus the SSE body reader. rustls, not native-tls - no OpenSSL anywhere
+# (harness/src/transport.rs:96-100 declares the same three features).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+# `time` ONLY, on purpose: the transport needs `tokio::time::timeout` (the 30-minute
+# ceiling) and `tokio::time::sleep` (the 429 pause). The multi-thread runtime, `net`
+# and `macros` arrive through axum below - in the NORMAL graph since `serve` landed, and
+# before that only through the axum dev-dependency - and the binaries that need a
+# multi-thread runtime add those features in their own wave (services declares its own
+# set). Stated as `["time"]` anyway because that is the harness's declaration verbatim.
+tokio = { version = "1", features = ["time"] }
+# `CancellationToken` for cancel safety (src/transport.rs): the caller's signal stops a
+# request before the head arrives, and dropping a stream cancels the upstream read.
+# `tokio_util::sync` is NOT feature-gated, so the feature list below is the harness's own
+# (`rt`) restated verbatim - same declaration, same resolution, no offline drift.
+tokio-util = { version = "0.7", features = ["rt"] }
+# `StreamExt` for the chunk stream the transport hands out (`StreamItem` is a boxed
+# stream, so the consumer needs no trait import to poll it).
+futures-util = "0.3"
+# `Bytes` is the item type of `reqwest::Response::bytes_stream()`, and it appears in the
+# private stream state, so the type has to be named. Already in the graph via
+# reqwest/hyper in both siblings, i.e. this adds a line, not a crate.
+bytes = "1"
+
+# ── The serving surface (src/serve.rs) ───────────────────────────────────────
+# The four provider routes ARE axum handlers, so axum is a LIBRARY dependency now and not
+# only a test one: `serve` answers JSON through `IntoResponse` and answers SSE through
+# `axum::body::Body::from_stream`, and `endpoint/provider/provider-route.rs` is compiled
+# INTO the services crate (`packages/typecrate/services/build.rs`), so both crates speak the
+# same axum major (0.8) and the same `Request`/`Response` types across that edge.
+#
+# DEFAULT FEATURES ONLY, and no `sse` feature anywhere - a load-bearing answer for the
+# sibling crate. The SSE response is built from `Body::from_stream` plus explicit
+# `Content-Type: text/event-stream` / `Cache-Control: no-cache` headers, which the default
+# feature set already provides (`serve::sse_response`, pinned byte-for-byte by
+# packages/typecrate/provider/tests/routes.rs); hono's `streamSSE` writes the same two
+# headers and leaves `Connection`/`Transfer-Encoding` to the HTTP stack, which hyper also
+# supplies. Requesting `sse` here would push a NEW feature grant onto
+# packages/typecrate/services, which declares axum with `json,query,ws`, for a body that
+# needs nothing from it.
+#
+# `json` and `query` are deliberately NOT requested either: `serve` reads bodies with
+# `axum::body::to_bytes` + `serde_json::from_slice` (both ungated in axum 0.8) and parses
+# query strings by hand, so the feature set stays exactly what the default is. That keeps
+# this lockfile a strict SUBSET of packages/typecrate/{harness,services}/Cargo.lock - the
+# rule `tests/transport.rs`'s subset test enforces, and the reason an offline build seeded
+# from either sibling's graph still resolves every crate here.
+axum = "0.8"
+
+# The scripted upstream in tests/transport.rs and tests/clients.rs is a REAL in-process axum
+# listener (the pattern in packages/typecrate/harness/tests/transport.rs:117-143); the library
+# has needed axum itself since `serve` landed, so nothing is left in this section but the test
+# runtime.
+[dev-dependencies]
+# The test runtime, the listener and `#[tokio::test]` - NOT `full`, and that is load-bearing for the
+# same offline reason as `tracing`'s trimmed features above: tokio's `full` turns on its optional
+# `parking_lot` dependency, and `parking_lot`/`lock_api`/`parking_lot_core`/`redox_syscall`/`scopeguard`
+# appear in ../harness/Cargo.lock (whose dev-deps DO use `full`) but NOT in
+# ../services/Cargo.lock. `full` therefore makes this lockfile leak five packages past the services
+# graph, and `the_lock_package_set_is_a_strict_subset_of_the_siblings` fails. The list below is
+# ../services/Cargo.toml:71's own feature vocabulary minus the daemon-only halves (`sync`, `signal`).
+tokio = { version = "1", features = [
+    "macros",
+    "net",
+    "io-util",
+    "rt-multi-thread",
+    "time",
+] }
+
+# Lint policy copied from the root workspace ([workspace.lints]) because a
+# standalone workspace does not inherit another workspace's lint table.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Release profile mirrors packages/typecrate/{harness,services} (and the root
+# workspace): this workspace is separate, so the settings have to be restated.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

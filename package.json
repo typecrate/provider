@@ -1,0 +1,37 @@
+{
+    "name": "@typecrate/provider",
+    "version": "1.0.2",
+    "description": "Rust-native private model provider for the TypeCrate scope: the vault-artifact credential/endpoint substrate and the OpenAI-compatible model clients ported from @agentic/provider.",
+    "private": true,
+    "type": "module",
+    "#identity": "npm identity for the Rust crate at packages/typecrate/provider. Crate name == npm name with @ dropped and / replaced by - (rust/README.md name mapping): @typecrate/provider <-> typecrate-provider <-> `use typecrate_provider::...`. The crate version and this version line are pinned together and src/lib.rs::version_matches_the_npm_line reads THIS file and asserts they agree. private: true because the artifact is a cargo build inside this repo, not a published package yet.",
+    "#layout": "Rust-first and native-only, the same shape packages/typecrate/harness and packages/typecrate/services use: Cargo.toml is a standalone Cargo workspace (its own explicit [workspace] boundary, because the root workspace globs only rust/crates/* and without the boundary cargo says 'current package believes it's in a workspace when it's not'), with ONE rlib target plus the `endpoint/provider/provider-route.rs` route module it exports. That decision is made: this crate owns no listener of its own — packages/typecrate/services links the rlib, discovers that endpoint file, and serves all four routes on its single gateway listener, so `PROVIDER_PORT` (8800) is the port the mount is declared for rather than a socket this crate binds. Artifacts land in the repo-root .rust/target because ../../../.cargo/config.toml sets target-dir; cargo picks that config up by walking up from this directory. The crate is excluded from the root workspace, so nothing here uses `.workspace = true` inheritance: edition/rust-version/version/license/publish, [lints] and [profile.release] are all restated literally.",
+    "#rust": "check / test / lint / build are plain cargo on the toolchain pinned by rust-toolchain.toml (1.99.1). Every one of them carries --locked (see #locked); --offline is NOT part of any script, exactly as in packages/typecrate/harness and packages/typecrate/services — it is added per invocation on a host with no registry access, where the graph in Cargo.lock IS the build. There is no vite-node pre-step here: unlike packages/typecrate/services this crate has no build-time route discovery, so every verb is pure cargo. Artifacts land in the repo-root .rust/target (see #layout).",
+    "#locked": "build/check/test/clippy run with --locked: Cargo.lock is committed for this standalone workspace, so the dependency graph can never be silently re-resolved by an npm script. Regenerate deliberately with `cargo generate-lockfile` (online) and commit it - never as a side effect of a script. `fmt`/`fmt:check` take no lock part. There is no vendored registry in this repo, so every dependency has to be one the sibling typecrate lockfiles already resolve (packages/typecrate/{harness,services}/Cargo.lock): axum and reqwest are declared now (the route layer needs them) at exactly those shared versions, and a new dependency needs an online lockfile refresh before it can build here.",
+    "#lint-vs-lint-strict": "`lint` is what root `turbo run test` executes (turbo test dependsOn lint), so it must not deny warnings; `lint:strict` is the -D warnings gate used by verify and CI. This mirrors packages/typecrate/services exactly; packages/typecrate/harness predates the split and has lint deny warnings on its own.",
+    "#scope": "PORTED TODAY (the whole port list, and src/lib.rs's module table is the maintained map): `vault.rs` the vault artifact loader (config/vault/generated/<scope>.json, the document `yarn workspace @config/vault export -- --consumer agentic-provider` writes; nothing here regenerates it), `transport.rs` the outbound OpenAI-compatible substrate (endpoints/credential pools, retry/rotation, JSON + SSE paths), `sse.rs` the frame codec, `error.rs` the failure taxonomy and error-frame wire shape, `pricing.rs`, `accounting.rs` the lifetime counters, `client.rs` the declarative model client, `clients.rs` the served row table, `registry.rs` rows+vault, and `serve.rs` the four service routes (chat completions, responses, models, stats) plus `endpoint/provider/provider-route.rs` for the services mount. STILL NOT PORTED, named in src/lib.rs: the /stats HTML dashboard and its cross-process buffer (this crate publishes the same projection as JSON), the Daytona GPU-sandbox substrate, and the Lightning Chat-to-Responses adapter (the TypeScript does not register those clients, so their absence IS the parity behaviour).",
+    "#artifact": "The loader never reads an environment variable and never defaults a path, so NOTHING here regenerates or requires the artifact: run `yarn workspace @config/vault export -- --consumer agentic-provider` to produce config/vault/generated/agentic-provider.json (git-ignored, absent on a fresh clone). When it is missing, the artifact-gated tests do NOT pass silently: the test that ran zero assertions prints its own name, the words NOT CHECKED, the artifact path, the regeneration command and the exact re-run (tests/registry.rs ::artifact). cargo test captures a PASSING test's stderr, so `--nocapture` is what surfaces that line - knowledge.md 'Known limitations' records the requirement, which is why this is louder than the config/vault/src/vault/artifact.test.ts analogue that puts the reason in the test title. Nothing fabricates a value.",
+    "scripts": {
+        "check": "cargo check --workspace --all-targets --locked",
+        "test": "cargo test --workspace --locked",
+        "lint": "cargo clippy --workspace --all-targets --locked",
+        "lint:strict": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        "fmt": "cargo fmt -p typecrate-provider",
+        "fmt:check": "cargo fmt -p typecrate-provider -- --check",
+        "build": "cargo build --release --locked",
+        "verify": "npm run fmt:check && npm run lint:strict && npm run test && npm run build"
+    },
+    "keywords": [
+        "typecrate",
+        "rust",
+        "provider",
+        "vault",
+        "credentials",
+        "openai"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "author": "NQQT",
+    "license": "MIT"
+}

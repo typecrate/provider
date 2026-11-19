@@ -1,0 +1,21 @@
+# Rust artifacts normally land in the repo-root .rust/target (the root
+# .cargo/config.toml sets target-dir), so `target/` only appears if someone
+# builds with an explicit --target-dir or outside that config. Same list as
+# packages/typecrate/services/.gitignore.
+target/
+/rust/target/
+
+# The npm side: this package.json exists to drive cargo, and yarn hoists every
+# dependency to the repo root anyway.
+node_modules/
+*.log
+
+# Scratch for this crate (root AGENTS.md scratch policy is the repo-root Temp/,
+# so this only catches a stray crate-local one).
+Temp/
+
+# NOTE: Cargo.lock is NOT ignored. This package is a standalone Cargo workspace,
+# so its lock is its own (the root lock and the sibling typecrate locks are
+# separate). It is committed because every cargo verb here runs with --locked;
+# deleting or stale-ing the lock is a deliberate `cargo generate-lockfile`, never
+# a side effect of an npm script.

@@ -56,9 +56,8 @@ use typecrate_provider::{
     serve::{
         CHAT_COMPLETIONS_ROUTE, DEFAULT_VAULT_ARTIFACT, HANDLER_NOT_FOUND, INTERNAL_ERROR,
         JSON_CONTENT_TYPE, MISSING_ID_ERROR, MODEL_CREATED_EPOCH, MODEL_OWNED_BY, MODELS_ROUTE,
-        MOUNT, PROVIDER_PORT, REGENERATION_COMMAND, REQUEST_BODY_LIMIT, RESPONSES_ROUTE,
-        STATS_ROUTE, ServeState, VaultSource, chat_completions, models, responses,
-        state_from_source, stats,
+        MOUNT, PROVIDER_PORT, REGENERATION_COMMAND, RESPONSES_ROUTE, STATS_ROUTE, ServeState,
+        VaultSource, chat_completions, models, responses, state_from_source, stats,
     },
     // The sentinel frame the route appends, imported from the codec rather than restated, so the
     // assertion is against the byte string the product writes.
@@ -676,7 +675,6 @@ fn the_mount_is_the_one_the_route_file_declares() {
         REGENERATION_COMMAND,
         "yarn workspace @config/vault export -- --consumer agentic-provider"
     );
-    assert_eq!(REQUEST_BODY_LIMIT, 1 << 20);
 }
 
 #[tokio::test]

@@ -89,10 +89,8 @@
 //!      [`crate::error::FailureSignals::upstream_status`]) and logged, where the TypeScript keeps it
 //!      only on the thrown `APIError` (`node_modules/openai/core/error.js:12`) that the gateway
 //!      discards.
-//!   4. **The JSON body limit is stated locally** ([`REQUEST_BODY_LIMIT`], the same 1 MiB the
-//!      services router applies at `packages/typecrate/services/src/server/mod.rs:85`) so this
-//!      module answers the same request the same way whether that router serves it or a test drives
-//!      it directly.
+//!   4. **There is no request-body cap.** PARITY, not a deviation: the deployed gateway imposes none,
+//!      and neither does this module - a body of any size is read in full.
 //!
 //! # The secret rule this module is responsible for
 //!
@@ -167,11 +165,6 @@ pub const STATS_ROUTE: &str = "/providers/private/v1/stats";
 /// constant is the single place the value is documented in Rust, and `tests/routes.rs` asserts the
 /// route file's literal agrees with it.
 pub const PROVIDER_PORT: u16 = 8800;
-
-/// The request-body ceiling, mirroring `MAX_REQUEST_BODY_BYTES` of the services router
-/// (`packages/typecrate/services/src/server/mod.rs:85`, `1 << 20`). Stated locally so this module is
-/// honest when it is driven without that router - deviation 4.
-pub const REQUEST_BODY_LIMIT: usize = 1 << 20;
 
 /// Inline vault document, highest priority. Named after the crate rather than after the consumer
 /// scope: the value IS a vault artifact, and which scope it was exported for is the artifact's own
@@ -841,8 +834,8 @@ pub fn health_document() -> Value {
 /// also reach it:
 ///   1. a verb the route does not declare -> `400 {"error":"handler not found"}` (`handler.ts:42`);
 ///   2. the vault unavailable -> `503` (the port's own state);
-///   3. a body that cannot be READ (transport error, or over [`REQUEST_BODY_LIMIT`]) -> `500
-///      {"error":"Internal Server Error"}` — the port's own cap, deviation 4; a body that PARSES to
+///   3. a body that cannot be READ (transport error) -> `500
+///      {"error":"Internal Server Error"}` — the port's own verdict; a body that PARSES to
 ///      nothing usable (malformed JSON, an array, a scalar) is folded into the empty object the
 ///      gateway folds it into and therefore falls through to gate (4), while a body of `null` takes
 ///      the same `500` as an unreadable body because the TypeScript's destructure throws on it
@@ -877,7 +870,7 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
         return error(StatusCode::BAD_REQUEST, HANDLER_NOT_FOUND);
     }
 
-    // (2) Readiness, before any body is read: a refused route must not pay for a 1 MiB read.
+    // (2) Readiness, before any body is read: a refused route must not pay to read the body.
     let registry = match state {
         ServeState::Ready(registry) => registry,
         ServeState::Unavailable(reason) => return unavailable(reason),
@@ -885,13 +878,13 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
 
     let (_, body) = request.into_parts();
 
-    // (3) The body, part one: the READ. An unreadable body or an over-limit body has no TypeScript
-    // counterpart at all (the gateway has no body cap - deviation 4 states the local limit), so it
-    // stays the gateway's constant 500 with the real reason in the log.
-    let Ok(bytes) = axum::body::to_bytes(body, REQUEST_BODY_LIMIT).await else {
+    // (3) The body, part one: the READ. An unreadable body has no TypeScript counterpart at all
+    // (the gateway has no body cap either), so it stays the gateway's constant 500 with the real
+    // reason in the log.
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
         tracing::error!(
             target: "typecrate_provider::serve",
-            "{endpoint}: the request body could not be read or exceeded {REQUEST_BODY_LIMIT} bytes"
+            "{endpoint}: the request body could not be read"
         );
 
         return error(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR);
@@ -1077,8 +1070,9 @@ pub async fn stats(state: &ServeState, request: Request) -> Response {
     let query = parts.uri.query().map(str::to_owned);
     // The reset verb never reads a body, but it is drained rather than left unconsumed: an
     // unconsumed body on a kept-alive connection is a protocol question the handler should answer
-    // explicitly, and the cost is one bounded read.
-    let _ = axum::body::to_bytes(body, REQUEST_BODY_LIMIT).await;
+    // explicitly, and the drain is streamed rather than buffered, so it imposes no size cap.
+    let mut stream = body.into_data_stream();
+    while stream.next().await.is_some() {}
 
     match method {
         Method::GET => json(StatusCode::OK, stats_document(registry)),

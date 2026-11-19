@@ -10,9 +10,9 @@
 //! # Why a bin at all, when the rlib already has a host
 //!
 //! `endpoint/provider/provider-route.rs` compiles the same four handlers into
-//! `typecrate-services`, which owns the CORS layer, the body cap, the access log and the
-//! multi-listener bind. That is the right host for a repo dev box. It is the wrong host for a
-//! cloud container: a modal/daytona payload is ONE executable plus ONE stage directory, and
+//! `typecrate-services`, which owns the CORS layer, the body cap for its own extractor routes, the
+//! access log and the multi-listener bind. That is the right host for a repo dev box. It is the
+//! wrong host for a cloud container: a modal/daytona payload is ONE executable plus ONE stage directory, and
 //! pulling `typecrate-services` in would drag its generated route table, its playground
 //! builtins and its `/v1/harness` gateway along, and would mean a container that runs Node or a
 //! second binary to serve a provider. So this bin links ONLY `typecrate_provider`, and
@@ -554,21 +554,17 @@ async fn run(config: Config, state: &'static serve::ServeState) -> i32 {
 ///     reasoning as `endpoint/provider/provider-route.rs` ("Why every group is `ANY`"), stated
 ///     there for the services router and here for this one;
 ///   * `.layer` only affects routes registered BEFORE it, so [`DefaultBodyLimit`] is added after
-///     the routes (no route escapes the cap) and [`serve::gateway`] is added LAST, so the
-///     cross-origin set and the preflight `204` cover every response this process can produce,
-///     including a fallback 404. Identical layer order to
-///     `packages/typecrate/services/src/server/mod.rs:480-539`, which is the point: the same
-///     request gets the same headers whichever host served it.
+///     the routes and [`serve::gateway`] is added LAST, so the cross-origin set and the preflight
+///     `204` cover every response this process can produce, including a fallback 404. Identical
+///     layer order to `packages/typecrate/services/src/server/mod.rs:480-539`, which is the point:
+///     the same request gets the same headers whichever host served it.
 ///
 /// `/health` is the one path here that is not the contract's, and it is deliberately OUTSIDE
 /// [`serve::MOUNT`]: a probe path must not appear in the route table services lists for this
 /// package.
 ///
-/// The body cap is enforced by `DefaultBodyLimit`, and the *wire* answer to an over-cap body is
-/// still the handler's own `500 {"error":"Internal Server Error"}` - the cap makes the body
-/// unreadable, and an unreadable body is what the deployed gateway folds into a 500
-/// (`src/serve.rs`, deviation 3 and 4). This host does not invent a 413 the TypeScript does not
-/// have.
+/// There is **no** request-body cap, matching the deployed gateway: [`DefaultBodyLimit::disable`]
+/// turns off axum's 2 MiB default as well, so no layer can refuse a body the handlers would read.
 pub(crate) fn router() -> Router<Arc<serve::ServeState>> {
     Router::new()
         .route(serve::CHAT_COMPLETIONS_ROUTE, any(chat_completions))
@@ -576,7 +572,7 @@ pub(crate) fn router() -> Router<Arc<serve::ServeState>> {
         .route(serve::MODELS_ROUTE, any(models))
         .route(serve::STATS_ROUTE, any(stats))
         .route(HEALTH_PATH, get(health))
-        .layer(DefaultBodyLimit::max(serve::REQUEST_BODY_LIMIT))
+        .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn(serve::gateway))
 }
 

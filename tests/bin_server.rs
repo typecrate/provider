@@ -18,9 +18,10 @@
 //! reaches each of them.
 //!
 //! WHY THE ROUTER IS SERVED OVER A REAL SOCKET: `router()` is where the mount contract lives —
-//! `ANY` on the four paths, `GET` only on `/health`, the body cap, the gateway layer. A verb that
-//! takes 400 on a contract route and a verb that takes 405 on `/health` is exactly the difference
-//! between "handler verdict" and "router verdict", and only a request can tell them apart.
+//! `ANY` on the four paths, `GET` only on `/health`, the disabled body limit, the gateway layer. A
+//! verb that takes 400 on a contract route and a verb that takes 405 on `/health` is exactly the
+//! difference between "handler verdict" and "router verdict", and only a request can tell them
+//! apart.
 //! `tests/gateway.rs:19-24` gives the same reasoning for the layer it covers.
 
 #![allow(clippy::too_many_lines)]
@@ -38,9 +39,9 @@ use tracing_core::Level;
 use typecrate_provider::{
     registry::Registry,
     serve::{
-        self, CHAT_COMPLETIONS_ROUTE, DEFAULT_VAULT_ARTIFACT, HANDLER_NOT_FOUND, INTERNAL_ERROR,
-        JSON_CONTENT_TYPE, MISSING_ID_ERROR, MODELS_ROUTE, REGENERATION_COMMAND,
-        REQUEST_BODY_LIMIT, RESPONSES_ROUTE, STATS_ROUTE, ServeState, VAULT_JSON_ENV,
+        self, CHAT_COMPLETIONS_ROUTE, DEFAULT_VAULT_ARTIFACT, HANDLER_NOT_FOUND, JSON_CONTENT_TYPE,
+        MISSING_ID_ERROR, MODELS_ROUTE, REGENERATION_COMMAND, RESPONSES_ROUTE, STATS_ROUTE,
+        ServeState, VAULT_JSON_ENV,
     },
 };
 
@@ -681,18 +682,14 @@ async fn the_contract_routes_answer_503_while_health_still_answers_200() {
 }
 
 #[tokio::test]
-async fn an_over_limit_body_takes_the_gateways_500_and_not_a_local_413() {
-    // The pair that proves the cap is live and wire-compatible: the SAME route answers 404 for a
-    // body inside [`REQUEST_BODY_LIMIT`] (the model lookup refuses an unknown id) and 500 for one
-    // over it (an unreadable body is what the deployed gateway folds into a 500 —
-    // `src/serve.rs` deviation 3 and 4). The 413 the TypeScript never produces is not invented
-    // here. The handler enforces the cap through `to_bytes(.., REQUEST_BODY_LIMIT)`;
-    // `DefaultBodyLimit` is mounted as well because the contract states it, and this is the
-    // assertion that the combination still produces the contract's answer.
+async fn a_body_over_one_mebibyte_is_read_in_full_and_reaches_the_model_lookup() {
+    // There is no request-body cap: a body several times the old 1 MiB ceiling is read in full and
+    // answered by the model lookup (404, the id owns no row) instead of the 500 an unreadable body
+    // produces. `to_bytes(.., usize::MAX)` and the disabled `DefaultBodyLimit` are what make the
+    // large request take the SAME verdict as the small one.
     let address = serve(ready_state()).await;
-    assert_eq!(REQUEST_BODY_LIMIT, 1 << 20);
 
-    let inside = request(
+    let small = request(
         &address,
         Method::POST,
         CHAT_COMPLETIONS_ROUTE,
@@ -700,27 +697,27 @@ async fn an_over_limit_body_takes_the_gateways_500_and_not_a_local_413() {
         Some(r#"{"model":"nope/missing","input":"hi"}"#.to_owned()),
     )
     .await;
-    assert_eq!(inside.status.as_u16(), 404);
+    assert_eq!(small.status.as_u16(), 404);
     assert_eq!(
-        inside.json(),
+        small.json(),
         serde_json::json!({ "error": "Model 'nope/missing' not found" })
     );
 
-    let oversized = request(
+    let large = request(
         &address,
         Method::POST,
         CHAT_COMPLETIONS_ROUTE,
         &[("content-type", JSON_CONTENT_TYPE)],
         Some(format!(
-            r#"{{"model":"x","input":"{}"}}"#,
-            "u".repeat(REQUEST_BODY_LIMIT),
+            r#"{{"model":"nope/missing","input":"{}"}}"#,
+            "u".repeat(2 * 1024 * 1024),
         )),
     )
     .await;
-    assert_eq!(oversized.status.as_u16(), 500);
+    assert_eq!(large.status.as_u16(), 404);
     assert_eq!(
-        oversized.json(),
-        serde_json::json!({ "error": INTERNAL_ERROR })
+        large.json(),
+        serde_json::json!({ "error": "Model 'nope/missing' not found" })
     );
 }
 

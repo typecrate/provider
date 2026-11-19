@@ -19,8 +19,9 @@
 //! already a dependency of this crate, so a real socket costs nothing. The predicates and the
 //! document builder, by contrast, are asserted as pure values.
 //!
-//! WHAT LIVES ELSEWHERE: the bin's own routing (`/health`, `ANY`, the body cap, the credential
-//! gate, the log filter) is `tests/bin_server.rs`; the four handlers' bodies are `tests/routes.rs`.
+//! WHAT LIVES ELSEWHERE: the bin's own routing (`/health`, `ANY`, the disabled body limit, the
+//! credential gate, the log filter) is `tests/bin_server.rs`; the four handlers' bodies are
+//! `tests/routes.rs`.
 
 use axum::{
     Router,

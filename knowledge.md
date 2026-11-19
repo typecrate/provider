@@ -538,8 +538,8 @@ consequence reaches beyond the file that records them: per-row pools (drain budg
 credential on drain (wire header), the registry's refuse-don't-coerce rule (a deployment that half
 worked in TypeScript hard-fails here, by design), the label allow-list (a hostile label is refused at
 build rather than printed), attempt/latency/cache-write additions (no parity figure depends on them),
-and the locally stated body limit (`serve.rs:92-95`, the same `1 << 20` the services router applies at
-`packages/typecrate/services/src/server/mod.rs:85`).
+and no request-body cap (`serve.rs:92-93`: the deployed gateway imposes none, so neither the handler
+nor the standalone bin does — `DefaultBodyLimit::disable`).
 
 **S8 Counters.** The TypeScript base tracks ~17 members: the 10 lifetime counters
 (`model-class.ts:417`-`:495`, first field `inputTokenTotal` at `:417`, last

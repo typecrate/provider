@@ -166,7 +166,7 @@ The rlib half. `packages/typecrate/services` declares
 `packages/typecrate/provider/endpoint/provider/provider-route.rs` into its own crate the same way it
 compiles its samples and the `/v1/harness` bridge — a route source by NAME and directory, never by
 contents. There the provider has no process of its own: it is started by starting services, and the
-gateway supplies the CORS layer, the body cap, the access log and the multi-listener bind that the bin
+gateway supplies the CORS layer, the access log and the multi-listener bind that the bin
 does not have:
 
 One build-time caveat comes with that mechanism: cargo's watch set for the scan is deliberately
@@ -193,10 +193,10 @@ extra listener serves `server::app_for(Some(port), state)`
 header policy wholesale: wildcard CORS and `Access-Control-Allow-Private-Network: true` are added to
 every response by one function (`packages/typecrate/services/src/server/mod.rs:358-379`, the `*` value
 at `:353`, and the unlisted header's name spelled once at `:343-347`), with **no per-port exclusion
-mechanism** on the Rust side. The 1 MiB body ceiling is
-the same on every listener (`packages/typecrate/services/src/server/mod.rs:85`, restated locally at
-`packages/typecrate/provider/src/serve.rs:173` so the module is honest when a test drives it without
-that router).
+mechanism** on the Rust side. **No request-body ceiling applies to the provider routes on either
+host**: the handlers take `Request` and read the body themselves, so the router's
+`DefaultBodyLimit` never governs them (`packages/typecrate/services/src/server/mod.rs:85-96`), and
+the standalone bin disables axum's own 2 MiB default (`src/bin/server.rs:568-577`).
 
 One CORS nuance an operator has to know before reading the verb-gate rule below: a real **preflight**
 (an `OPTIONS` carrying `Access-Control-Request-Method`) is answered by the gateway layer with a
@@ -483,9 +483,9 @@ Gate order on the two POST surfaces (`serve.rs:723-737`, code `:756-871`):
 
 1. verb → `400 {"error":"handler not found"}` (`serve.rs:759-761`);
 2. readiness → `503` (the port's own state, `serve.rs:763-767`; the body is not read, so a refused
-   route never pays for a 1 MiB read);
-3. body cannot be READ — a transport error, or over `REQUEST_BODY_LIMIT` (`serve.rs:173`,
-   enforced at `:774`) — → `500 {"error":"Internal Server Error"}`, the gateway's constant for a
+   route never pays to read it);
+3. body cannot be READ — a transport error (`serve.rs:884-891`) — → `500 {"error":"Internal Server
+   Error"}`, the gateway's constant for a
    handler throw (`packages/underload/service/src/server/start.ts:908-911`, the body at `:910`),
    with the real reason in the log only. A body that PARSES (`serve.rs:800`) into malformed JSON,
    an array or a scalar is **folded into the empty object** the deployed gateway folds it into
@@ -633,9 +633,9 @@ Evidence: `grep -rn "DEVIATION" --include=*.rs src endpoint tests` in `packages/
 | `tests/registry.rs:1052` | Same deviation, registry side: the row keeps its **last credential label** after the drain. | As above; the row is unreachable through the catalog anyway. | `switch_base_url()` reports the drain as sticky (`false`), the label remains nameable for diagnostics, and the catalog stays correct. |
 
 Prose-only deviations that are not marked with a `DEVIATION` token, so a grep for the token alone
-under-counts them: the three numbered serve deviations plus the parity note between them
-(`serve.rs:54-95`: JSON-only stats, the row-owned upstream path, the verified malformed-body and
-pre-stream-500 parity, the locally stated body limit), the
+under-counts them: the numbered serve deviations plus the parity notes between them
+(`serve.rs:54-93`: JSON-only stats, the row-owned upstream path, the verified malformed-body and
+pre-stream-500 parity, no request-body cap), the
 "still to port" list (`lib.rs:29-38`), the two omitted client surfaces (`lib.rs:49-56`,
 `clients.rs:21-43`), and the unported per-call `options.baseUrl`
 (`client.rs:145-159` — `knowledge.md` records how its stale `options.baseUrl` evidence was corrected).

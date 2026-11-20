@@ -253,19 +253,19 @@ and the config it posts (the `x-runtime-config` header, no `x-runtime-profile` h
 Why each of those choices, in order:
 
 * **No profile header ⇒ the container's anonymous profile.** `generic` is the profile for a payload
-  nobody knows anything about (`services/daytona/sandbox/runtime-lib.mjs:75-96`): the allowed config
+  nobody knows anything about (`services/daytona/sandbox/runtime-server/src/contract.rs`): the allowed config
   keys are `runCmd, port, probePath, probeTimeoutSec, stopSignal, buildCmd, buildTimeoutSec,
   artifactPath, env`, the defaults are `port 8080` / `SIGTERM` / `probeTimeoutSec 60`, and it adds no
   key, no signature and no registry lookup. A tar.gz **must** carry `runCmd` (an archive can hold
-  anything, so the runner refuses to guess — `runtime-lib.mjs:85-87`).
-* **No `probePath` ⇒ readiness is a bare TCP connect** (`runtime-lib.mjs:82-84`), which is the only
+  anything, so the runner refuses to guess — `contract.rs`).
+* **No `probePath` ⇒ readiness is a bare TCP connect** (`contract.rs`), which is the only
   probe rule that assumes nothing about the payload. Passing `--probe-path /health` is supported and
   documented, but on a **Modal box it is a trap**: the runner's own routes shadow the service's at
   `/`, `/health`, `/tools`, `/stats`, `/status`, `/logs`
   (`services/modal/deploy/sandbox/modal-sandbox-container.py:300`, and the forwarding rules at
   `:126-131`), so that probe would answer from the **runner**, not from the provider.
 * **`port: 8800`** equals `serve::PROVIDER_PORT` (`src/serve.rs:169`) and the bin's own default. The
-  runner forces `PORT` to the declared port in the child environment (`runtime-server.mjs:438`
+  runner forces `PORT` to the declared port in the child environment (`the Rust runtime-server`
   `childEnv`, `modal-sandbox-container.py:1895-1899` `_child_env`) and the bin honours `PORT`
   (`src/bin/server.rs:104`, `:137-139`), so a deploy needs no flag — and `--env PORT=…` is therefore
   the wrong knob (`portCollisionNotes`, `scripts/deploy-endpoint.ts:446-450`, says so).
@@ -280,7 +280,7 @@ Why each of those choices, in order:
 token layer of its own (`modal-sandbox-container.py:301-306`) — so authentication is the payload's own
 business: the provider's upstream credentials ride **inside the bundle**. That is also why **no secret
 may go into `config.env`**: `GET /status` echoes the posted config verbatim to a caller that presented
-no secret (`runtime-lib.mjs:90-93`), and `env` therefore carries only the *relative path* to the
+no secret (`contract.rs`), and `env` therefore carries only the *relative path* to the
 document. `cwd` inside the container is the stage directory, so `./agentic-provider.json` resolves
 (`src/bin/server.rs:156-158`). `--env K=V` is for non-secret wiring only.
 
@@ -823,6 +823,6 @@ moved when its identity constants became env-overridable) was corrected in place
 `scripts/deploy-endpoint.ts:150-157` (the `DEFAULT_PORT` doc, whose drifted cite sits at `:154-155`),
 `:438-445` (the `portCollisionNotes` doc, cite at `:441-442`) and `scripts/start-modal.ts:27-30` (the
 "A SECOND BOX" comment, cite at `:29`) — each pointer now names **the declaration the cite lives in**, not a
-bare line, because the two read-only files those cites point AT (`services/daytona/sandbox/runtime-lib.mjs`
+bare line, because the two read-only files those cites point AT (`services/daytona/sandbox/runtime-server/src/contract.rs`
 and the Modal container file) are edited elsewhere in this session and renumber again; a number goes
 silently wrong, a symbol name stays greppable.

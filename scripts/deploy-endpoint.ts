@@ -21,7 +21,7 @@
 //  workloads share — this file is a thin WORKLOAD declaration on top of it: it names
 //  the crate, the bin, the payload members and the config, and changes nothing else.
 //
-//  THE PAYLOAD (fixed contract, services/daytona/sandbox/runtime-lib.mjs:75-96):
+//  THE PAYLOAD (fixed contract, services/daytona/sandbox/runtime-server/src/contract.rs):
 //
 //      bundle   typecrate-provider.tar.gz — flat, gzip, exactly two members
 //      ┌────────────────────────────┬────────┬───────────────────────────────────┐
@@ -40,14 +40,14 @@
 //                       RUST_LOG: 'info' } }
 //
 //  NO `probePath` BY DESIGN. The anonymous profile treats an ABSENT `probePath` as
-//  "ready when the port accepts a TCP connection" (runtime-lib.mjs:82-84), which is the
+//  "ready when the port accepts a TCP connection" (contract.rs), which is the
 //  only readiness rule that does not assume the container knows something about the
 //  payload. `--probe-path /health` opts back into the HTTP 2xx probe — and `/health`
 //  exists here (bin/server.rs HEALTH_PATH), unlike most payloads; it is opt-in because
 //  it makes the deploy depend on a path the box has to forward.
 //
 //  CREDENTIALS TRAVEL IN THE BUNDLE, NOT IN `env`. `GET /status` echoes the posted
-//  config VERBATIM to a caller that presented no secret (runtime-lib.mjs:90-93, and the
+//  config VERBATIM to a caller that presented no secret (contract.rs, and the
 //  client's own `configNotes` warns about it), and the container has no auth by default
 //  — so a key placed in `config.env` would be published to anyone who can reach the
 //  URL. The vault document is therefore a bundle MEMBER and `env` carries only the
@@ -151,7 +151,7 @@ export const PAYLOAD_FILENAME = 'typecrate-provider.tar.gz';
  * The provider's listener. MUST equal `serve::PROVIDER_PORT` (src/serve.rs:169) and the
  * bin's own default (src/bin/server.rs, `PORT` → 8800); it is restated here because the
  * PAYLOAD declares the port the runner probes, and a container runner injects `PORT`
- * from that declaration (runtime-server.mjs:438 `childEnv`,
+ * from that declaration (the Rust runtime-server `childEnv`,
  * modal-sandbox-container.py:1895-1899 `_child_env`), so
  * the two numbers cannot be allowed to drift.
  */
@@ -404,7 +404,7 @@ export const buildPayloadEnv = (flags: Pick<ProviderFlags, 'env'>): Record<strin
 
 /**
  * `runCmd` — the only line that names the entry point. The anonymous profile refuses to
- * guess it for an ARCHIVE (runtime-lib.mjs:308-312), and the exec bit plus a flat member
+ * guess it for an ARCHIVE (contract.rs), and the exec bit plus a flat member
  * name is what makes `./<member>` work from the stage dir.
  */
 export const buildRunCmd = (flags: Pick<ProviderFlags, 'allowUnconfigured'>): string => `./${SERVER_MEMBER}${flags.allowUnconfigured ? ' --allow-unconfigured' : ''}`;
@@ -438,7 +438,7 @@ export const buildPayloadEntries = (artifactPath: string, vaultPath: string): Pa
 /**
  * `PORT` in `config.env` would fight the runner: it FORCES `PORT` to the declared
  * `config.port` in the child environment, and `config.env` wins over that injection
- * (runtime-server.mjs:438 `childEnv`, modal-sandbox-container.py:1895-1899
+ * (the Rust runtime-server `childEnv`, modal-sandbox-container.py:1895-1899
  * `_child_env`). So `--env PORT=9100`
  * --port 8800 boots a server the probe is watching on the wrong port. Reported, not
  * fatal: an operator who sets both numbers equal has said something sensible.

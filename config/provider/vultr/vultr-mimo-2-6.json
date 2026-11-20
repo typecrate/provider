@@ -13,7 +13,7 @@
         "cache_read": 0.44,
         "output": 0.87
     },
-    "enabled": false,
+    "enabled": true,
     "reasoning_effort": "high",
     "context_length": 262144
 }

@@ -8,7 +8,7 @@
 //!     subset with the artifact;
 //!   * A6 - `i` (a hostile relay label blocks the build and is never echoed), with the real
 //!     artifact labels in `f` and the allow-list itself pinned in `tests/clients.rs`;
-//!   * A7 - `a` and `c` (alphabetical id order, the 11 discoverable ids, the 18 hidden ids, and the
+//!   * A7 - `a` and `c` (alphabetical id order, the 15 discoverable ids, the 14 hidden ids, and the
 //!     one model the table omits);
 //!   * A8 - `b`, which projects every field of all 29 rows: that projection IS the row recipe
 //!     the next task builds on;
@@ -541,7 +541,7 @@ fn b_every_row_is_a_declarative_row_and_this_is_the_whole_table() {
             "vultr_api_endpoints",
             "plain",
             (0.10, 0.10, 0.35),
-            false,
+            true,
             Some("max"),
             false,
         ),
@@ -554,7 +554,7 @@ fn b_every_row_is_a_declarative_row_and_this_is_the_whole_table() {
             "vultr_api_endpoints",
             "plain",
             (0.75, 0.75, 3.00),
-            false,
+            true,
             Some("max"),
             false,
         ),
@@ -580,7 +580,7 @@ fn b_every_row_is_a_declarative_row_and_this_is_the_whole_table() {
             "vultr_api_endpoints",
             "plain",
             (0.44, 0.44, 0.87),
-            false,
+            true,
             Some("high"),
             false,
         ),
@@ -606,7 +606,7 @@ fn b_every_row_is_a_declarative_row_and_this_is_the_whole_table() {
             "vultr_api_endpoints",
             "plain",
             (0.15, 0.15, 0.60),
-            false,
+            true,
             Some("high"),
             false,
         ),
@@ -852,8 +852,8 @@ fn c_the_live_artifact_builds_every_row_and_the_discoverable_subset_matches_the_
         "the vault supplies pools and must not touch the order"
     );
 
-    // The catalog's projection: the TypeScript's twelve discoverable models minus daytona,
-    // now in the table's alphabetical-by-id order.
+    // The catalog's projection after enabling the four Vultr rows, now in the table's
+    // alphabetical-by-id order.
     assert_eq!(
         registry.discoverable_ids(),
         vec![
@@ -868,11 +868,15 @@ fn c_the_live_artifact_builds_every_row_and_the_discoverable_subset_matches_the_
             "token-router/glm-5.3",
             "token-router/glm-5.3-flash",
             "token-router/sol",
+            "vultr/ds4-flash",
+            "vultr/glm-5.3",
+            "vultr/glm-5.3-flash",
+            "vultr/mimo-2-6",
         ],
-        "A7: eleven discoverable rows, in alphabetical id order"
+        "A7: fifteen discoverable rows, in alphabetical id order"
     );
 
-    // The other half of the same fact: eighteen rows are not in the catalog, and their order is
+    // The other half of the same fact: fourteen rows are not in the catalog, and their order is
     // the registry's too (the projection filters, it never sorts).
     assert_eq!(
         registry
@@ -896,15 +900,11 @@ fn c_the_live_artifact_builds_every_row_and_the_discoverable_subset_matches_the_
             "nvidia/glm-5.3",
             "nvidia/kimi-k3",
             "open-router/glm-5.3-flash",
-            "vultr/ds4-flash",
-            "vultr/glm-5.3",
-            "vultr/glm-5.3-flash",
-            "vultr/mimo-2-6",
         ],
-        "A7: eighteen hidden rows"
+        "A7: fourteen hidden rows"
     );
 
-    // The reason for each hidden row, from the artifact itself. Seventeen rows carry
+    // The reason for each hidden row, from the artifact itself. Thirteen rows carry
     // `enabled: false` (the table's own `.hidden()`), and exactly one row is hidden while it is
     // still enabled: open-router, whose only vault entry classifies `invalid`. That row is the
     // live proof of the TypeScript's `model-class.test.ts:288-296` - routable by id, absent
@@ -1600,7 +1600,7 @@ fn m_the_process_registry_installs_once_and_aggregates_every_row_ledger() {
         .unwrap_or_else(|error| panic!("a second install returns the first: {error}"));
     assert!(std::ptr::eq(installed, kept), "no rebuild, no reset");
     assert_eq!(installed.clients().len(), 29);
-    assert_eq!(installed.discoverable_ids().len(), 11);
+    assert_eq!(installed.discoverable_ids().len(), 15);
 
     // The roll-up: `aggregate()` is the field-by-field sum of the row ledgers, and cost is
     // deliberately NOT part of it (each row prices its own tokens at its own rates).

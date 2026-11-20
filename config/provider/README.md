@@ -54,7 +54,7 @@ is the alphabetical order of `id`.
         "cache_read": 0.75,
         "output": 3.0
     },
-    "enabled": false,
+    "enabled": true,
     "reasoning_effort": "max",
     "context_length": 262144
 }

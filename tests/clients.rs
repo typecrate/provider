@@ -1771,7 +1771,7 @@ async fn the_discoverability_table_matches_the_typescript_validity_matrix() {
         assert_eq!(client.is_discoverable(), want, "{label} credential");
     }
 
-    // `enabled:false` hides a row whose credential is perfectly valid (the 18 hidden rows).
+    // `enabled:false` hides a row whose credential is perfectly valid (the 14 hidden rows).
     let (address, _) = provider(vec![]).await;
     let hidden = client_with_pool(
         row("makora/glm5-flash").hidden(),

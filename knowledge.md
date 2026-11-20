@@ -60,7 +60,7 @@ acceptance letters they cite.
    buffer (S3, `runtime/endpoint/provider/private/stats/stats-buffer.ts`). Nothing else in the crate
    is a placeholder. **Do not read item 8 against item 7:** hosting *the provider itself* on Daytona (a
    `start:daytona` sandbox) has nothing to do with the `daytona/qwen3.8-27b` **row**, whose upstream base
-   URL only exists after a GPU-sandbox boot — the row stays unported and `/models` still answers 11 rows.
+   URL only exists after a GPU-sandbox boot — the row stays unported and `/models` answers 15 rows.
 9. **Open parity decisions** a later stage has to settle, not implement blind: whether a drained row
    should drop its credential header (the drain markers in `tests/clients.rs:1242` and
    `tests/registry.rs:1052`), and whether JSON-only `/stats` is the target shape or a stopgap.
@@ -494,8 +494,9 @@ quietly re-litigate.
 whose upstream cannot exist until a sandbox boots, and its endpoint is a sandbox handle rather than a
 vault entry (`daytona_api_endpoints/STANDARD` is a placeholder URL). The TypeScript keeps it registered
 at `packages/agentic/provider/src/registry.ts:68` and pins it discoverable at
-`model-class.test.ts:311-315`. Consequence: `/models` answers 11 rows where the TypeScript answers 12
-(`model-class.test.ts:278`), and a caller routing `daytona/qwen3.8-27b` gets this port's 404. Porting
+`model-class.test.ts:311-315`. Consequence: `/models` answers 15 rows — the TypeScript's 12 minus
+Daytona plus the four Vultr rows this table enables (`model-class.test.ts:278`) — and a caller routing
+`daytona/qwen3.8-27b` gets this port's 404. Porting
 it means porting the sandbox substrate — a separate module row in `lib.rs`, not a new `ClientSpec`.
 
 **S2 Lightning.** Four clients, unregistered in TypeScript (`registry.ts`: the offering is disabled,

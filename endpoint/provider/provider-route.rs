@@ -50,13 +50,14 @@
 //!
 //! # Why every group declares `port: 8800`
 //!
-//! All four TypeScript route objects carry `port: LOCAL_AREA_NETWORK_PROVIDER_PORT` — `6660`, from
-//! `config/environment/src/port.ts:4` — and the TypeScript gateway, like the services server here,
-//! binds one listener per distinct declared port (`packages/underload/service/src/server/start.ts:780`).
-//! The Rust surface publishes that listener as **8800** (the deviation is recorded in
-//! `packages/typecrate/provider/src/serve.rs`, on `PROVIDER_PORT`, and in `src/lib.rs`). The TS
-//! provider process also owns the `/playground*` and `/v1/services/*` builtins on that port; those
-//! belong to services and stay on the services default listener.
+//! All four TypeScript route objects carry `port: PRIVATE_PROVIDER_PORT` — `6660`, from
+//! `packages/agentic/provider/src/port.ts` — and the TypeScript gateway, like the services server
+//! here, binds one listener per distinct declared port
+//! (`packages/underload/service/src/server/start.ts:780`). The Rust surface publishes the deployed
+//! provider on **8800** (`packages/typecrate/provider/src/serve.rs`, `PROVIDER_PORT`), and consumers
+//! migrated to it through `LOCAL_AREA_NETWORK_PROVIDER_PORT` = `8800` (`@config/environment`).
+//! The TS provider process also owns the `/playground*` and `/v1/services/*` builtins on its 6660
+//! port; in the services host those belong to services and stay on the services default listener.
 
 use axum::{extract::Request, response::Response};
 
@@ -93,7 +94,7 @@ pub async fn stats(request: Request) -> Response {
 //
 // The trailer is per GROUP (the health sample shows both spellings side by side: the same path with
 // and without `port: 8010`), so all four groups carry it — the TypeScript puts
-// `port: LOCAL_AREA_NETWORK_PROVIDER_PORT` on all four route objects, and a group that omitted it
+// `port: PRIVATE_PROVIDER_PORT` on all four route objects, and a group that omitted it
 // here would quietly merge into the services default listener instead. `8800` is written as a literal
 // because the macro grammar is `, port: <literal>` and a route file cannot name a constant it did not
 // define; `packages/typecrate/provider/tests/routes.rs` pins `serve::PROVIDER_PORT` to that same

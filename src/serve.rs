@@ -145,15 +145,16 @@ pub const STATS_ROUTE: &str = "/providers/private/v1/stats";
 
 /// The listener these four groups declare.
 ///
-/// The TypeScript declares `port: LOCAL_AREA_NETWORK_PROVIDER_PORT` on all four route objects
+/// The TypeScript declares `port: PRIVATE_PROVIDER_PORT` on all four route objects
 /// (`runtime/endpoint/provider/private/{chat-completion,responses,models,stats}/service-route.ts`,
-/// value `6660` from `config/environment/src/port.ts:4`), and the TypeScript gateway binds one
+/// value `6660` from `packages/agentic/provider/src/port.ts`), and the TypeScript gateway binds one
 /// listener per distinct declared port (`packages/underload/service/src/server/start.ts:780`) - the
-/// same listener model the services server implements. This crate publishes **8800** instead of 6660:
-/// an explicit decision of this port task, because 6660 is the port the deployed TypeScript provider
-/// already owns on this machine (and the port `packages/typecrate/harness/src/config.rs:36` dials by
-/// default), so a Rust listener there would collide with the running TS surface rather than replace
-/// it.
+/// same listener model the services server implements. This crate publishes **8800** instead: the
+/// TypeScript provider keeps its own 6660 listener as the behavioural spec and fallback, while the
+/// deployed Rust provider is the one consumers dial. The consumer-facing
+/// `LOCAL_AREA_NETWORK_PROVIDER_PORT` is `8800` (`config/environment/src/port.ts:4`), and
+/// `packages/typecrate/harness/src/config.rs:36` /
+/// `packages/underload/harness/src/server/config.ts:272` both default to it.
 ///
 /// DEVIATION (deliberate, recorded): the listener number is not the TypeScript's. The paths, verbs,
 /// bodies and status codes are.

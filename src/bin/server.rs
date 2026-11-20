@@ -1,10 +1,11 @@
 //! `typecrate-provider-server` - the standalone `/providers/private/v1` listener.
 //!
-//! The native form of the TypeScript provider process
-//! (`runtime/endpoint/provider/private/*`, which the underload gateway binds on
-//! `LOCAL_AREA_NETWORK_PROVIDER_PORT` = 6660; the Rust surface publishes 8800 - the deviation
-//! is recorded on [`serve::PROVIDER_PORT`]). The library owns the handlers, the vault gate and
-//! the response shapes (`src/serve.rs`); this file is the thinnest possible process wrapper:
+//! The native form of the TypeScript provider process (`runtime/endpoint/provider/private/*`).
+//! The TypeScript listener stays on `PRIVATE_PROVIDER_PORT` = 6660 (`@agentic/provider/src/port`);
+//! this Rust surface is the deployed provider on 8800, recorded on [`serve::PROVIDER_PORT`].
+//! Consumers dial 8800 through `LOCAL_AREA_NETWORK_PROVIDER_PORT` (`@config/environment`). The
+//! library owns the handlers, the vault gate and the response shapes (`src/serve.rs`); this file is
+//! the thinnest possible process wrapper:
 //! flags, the credential gate, one bind, the banner, the shutdown signal.
 //!
 //! # Why a bin at all, when the rlib already has a host

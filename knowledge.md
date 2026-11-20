@@ -61,10 +61,9 @@ acceptance letters they cite.
    is a placeholder. **Do not read item 8 against item 7:** hosting *the provider itself* on Daytona (a
    `start:daytona` sandbox) has nothing to do with the `daytona/qwen3.8-27b` **row**, whose upstream base
    URL only exists after a GPU-sandbox boot — the row stays unported and `/models` still answers 11 rows.
-9. **Open parity decisions** a later stage has to settle, not implement blind: the port number
-   (S4), whether a drained row should drop its credential header (the drain markers in
-   `tests/clients.rs:1242` and `tests/registry.rs:1052`), and whether JSON-only `/stats` is the
-   target shape or a stopgap.
+9. **Open parity decisions** a later stage has to settle, not implement blind: whether a drained row
+   should drop its credential header (the drain markers in `tests/clients.rs:1242` and
+   `tests/registry.rs:1052`), and whether JSON-only `/stats` is the target shape or a stopgap.
 
 ## Decisions
 
@@ -127,8 +126,8 @@ acceptance letters they cite.
   The live artifact carries those 11 vendors, 20 slots and 43 entries, with
   `consumers: ["agentic-provider"]` (re-counted on this pass). The upstream guard that keeps the
   scope honest is `config/vault/src/vault/grants.test.ts` (regression guard #9), which scans
-  `packages/agentic/provider/src` — see "Cutover" below for what has to move when this crate becomes
-  the consumer.
+  `packages/agentic/provider/src` — see "Cutover" below for what still has to move now that this
+  crate is the consumer.
 - **The `sentinels` block is deliberately global.** The exporter filters vendors by scope and
   re-lists `sentinels` verbatim (`config/vault/scripts/export-vault.ts:308`, with the reason at
   `:173`: global vocabulary, not a secret). Consequence: the vocabulary is **not** scope-filtered, so
@@ -515,12 +514,13 @@ live counters (the TypeScript also clears the buffer entry, `private-stats.ts:10
 dashboard therefore stays on the TypeScript provider until either the page is ported or the dashboard
 is rewritten against this JSON.
 
-**S4 Port 8800.** Recorded at `serve.rs:147-168` and in `lib.rs`. 6660 is
-`LOCAL_AREA_NETWORK_PROVIDER_PORT` (`config/environment/src/port.ts:4`) and is owned by the running
-TypeScript provider — including that process's gateway builtins. The consequence nobody should
-discover by accident: `packages/typecrate/harness/src/config.rs:36` still defaults to
-`http://localhost:6660/providers/private/v1`, so the Rust provider is live but undialed. Nothing in
-this port changed a number outside its own crate; the reconciliation is a deliberate cutover decision
+**S4 Port 8800.** Recorded at `serve.rs:146-168` and in `lib.rs`. The TypeScript provider's own
+listener stays on `PRIVATE_PROVIDER_PORT` = 6660 (`packages/agentic/provider/src/port.ts`); the
+consumer-facing `LOCAL_AREA_NETWORK_PROVIDER_PORT` is 8800
+(`config/environment/src/port.ts:4`), and this crate publishes 8800. Consumers migrated to 8800 —
+both defaults (`packages/typecrate/harness/src/config.rs:36`,
+`packages/underload/harness/src/server/config.ts:272`) dial it — while the TypeScript implementation
+stays on 6660 as the behavioural specification and fallback; nothing consumes its 6660 port
 (README, "Two implementations, two ports").
 
 **S5 Keyless header.** See the policy section above. The alternative (`Suppress`) is one row-builder
@@ -643,7 +643,7 @@ crate or a package outside `packages/typecrate/provider`:
    (profile-bearing, port 8085, `SIGINT`), its tests are its acceptance surface, and no behaviour this
    task owns depends on the change.
 
-## Cutover: what the vault side needs when this crate becomes the consumer
+## Cutover: what the vault side still needs now that this crate is the consumer
 
 `config/vault/src/vault/grants.test.ts` is the regression guard that keeps
 `VAULT_CONSUMERS['agentic-provider']` equal to what the consumer actually imports, and its scanner

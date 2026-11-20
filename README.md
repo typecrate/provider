@@ -62,7 +62,7 @@ _Modelled on `packages/typecrate/harness/README.md:19-31`._
 | HTTP | `src/serve.rs` | The four routes: vault gate + lazy process state (`:414-435`), env source resolution (`:488-517`), the verb gate, the SSE relay, the catalog envelope, the stats document and the reset verb. The only module a route file has to name. |
 | Bridge | `endpoint/provider/provider-route.rs` | The `ANY` route file `typecrate-services` discovers at build time: four handler wrappers (`:65-85`) and one `service_routes!` block carrying `, port: 8800;` (`:101-117`). No logic. |
 | Own process | `src/bin/server.rs` | `[[bin]] typecrate-provider-server` (`Cargo.toml:70-72`): flags, the **fail-fast credential gate before the bind**, one `0.0.0.0` bind, the banner, the SIGTERM/SIGINT drain, a hand-written `tracing` subscriber, and this crate's own `serve::gateway` layer (`src/serve.rs:803`) so a container has CORS and preflight `204` without the services router. The only path it adds to the contract surface is `GET /health` (`:112`). |
-| Deploy verbs | `scripts/*.ts` | `deploy-endpoint.ts` (cargo → two-member tar.gz → `POST /` on any contract endpoint), `start-modal.ts` (the same verb, endpoint precedence), `start-daytona.ts` (creates a Daytona sandbox and deploys the same bundle). Thin declarations over the SHARED client `@services/daytona/sandbox`; guarded so importing them starts nothing (`scripts/entry-guard.ts`). |
+| Deploy verbs | `scripts/*.ts` | `deploy-endpoint.ts` (cargo → two-member tar.gz → `POST /apps`, or the blue-green `PUT /apps/provider`, on any sandbox-runtime v2 endpoint), `start-modal.ts` (the same verb, endpoint precedence), `start-daytona.ts` (creates a Daytona sandbox and registers the same bundle in it). Thin declarations over the SHARED client `@services/daytona/sandbox`; guarded so importing them starts nothing (`scripts/entry-guard.ts`). |
 
 ## Commands
 
@@ -219,14 +219,16 @@ container platform SDK, because all three drive the SAME client
 
 | Verb | What it is | Endpoint |
 | --- | --- | --- |
-| `deploy:endpoint` (`scripts/deploy-endpoint.ts`) | The platform-neutral verb: parse → `cargoReleaseBin` → `packagePayload` → `deployPayload` → summary. Takes `--token --port --probe-path --env --vault --out --no-build --artifact --no-teardown --teardown --no-wait --logs --dry-run --help`. | an argument (`<url>` / `--endpoint` / `TYPECRATE_PROVIDER_ENDPOINT`) |
-| `start:modal` (`scripts/start-modal.ts`) | That verb, aimed at a Modal box, plus the vault URL as the last-resort default. Thin on purpose (141 lines) — everything except the URL is the generic verb. | `--endpoint` > `TYPECRATE_PROVIDER_ENDPOINT` > `@config/vault` `modalContainer` |
-| `start:daytona` (`scripts/start-daytona.ts`) | Creates a Daytona sandbox of its own (`createSandbox`), deploys the same bundle into it, then mints the payload port's preview link. Adds `--public/--private --cpu --mem --disk --ttl --name --keep-on-fail`. | minted by the verb (the sandbox's runner-port preview link) |
+| `deploy:endpoint` (`scripts/deploy-endpoint.ts`) | The platform-neutral verb: parse → `cargoReleaseBin` → `packagePayload` → `deployPayload` → summary. Registers the app **`provider`** at `/app/provider/`, declaring `targetPrefix /providers/private/v1`. Takes `--token --admin-token --admin-token-file --port --probe-path --env --vault --out --no-build --artifact --no-teardown --teardown --no-wait --logs --dry-run --help`. | an argument (`<url>` / `--endpoint` / `TYPECRATE_PROVIDER_ENDPOINT`) |
+| `start:modal` (`scripts/start-modal.ts`) | That verb, aimed at a Modal box, plus the vault URL as the last-resort default. Thin on purpose (144 lines) — everything except the URL is the generic verb. | `--endpoint` > `TYPECRATE_PROVIDER_ENDPOINT` > `@config/vault` `modalContainer` |
+| `start:daytona` (`scripts/start-daytona.ts`) | Creates a Daytona sandbox of its own (`createSandbox`), registers the same bundle in it, and reports the app base on that sandbox's ONE origin (`<endpoint>/app/provider/`). Adds `--public/--private --cpu --mem --disk --ttl --name --keep-on-fail`. | minted by the verb (the sandbox's runner-port preview link) |
 
 `start:modal` keeps the endpoint a **parameter**, unlike `packages/typecrate/nexus/scripts/start-modal.ts:25-26`
 (which pins `main([Object.values(modalContainer)[0], …argv])`, so the vault value always wins): the box
-this repo deploys to is **occupied by another workload**, and one runner holds one payload slot. See
-[Getting a dedicated box](#getting-a-dedicated-box).
+this repo owns is **shared**, and under runtime v2 it serves several named apps side by side
+(`/app/nexus/`, `/app/provider/`, …), so the deploy is app-scoped and no peer is displaced. Which box
+receives the provider is still an operator decision — resources, admin auth and blast radius are the
+operator's, not a package constant's. See [Getting a dedicated box](#getting-a-dedicated-box).
 
 **The payload — fixed shape, two members, flat.** `packagePayload` (`runtime-deploy.ts`) builds one
 gzip tar with exactly these members and modes, because the container execs the first one and the second
@@ -237,14 +239,21 @@ typecrate-provider-server   mode 0755   the release ELF from build:server
 agentic-provider.json       mode 0644   config/vault/generated/agentic-provider.json, verbatim
 ```
 
-and the config it posts (the `x-runtime-config` header, no `x-runtime-profile` header at all) is exactly:
+The app identity rides in the two v2 metadata headers — `x-app-name: provider` and
+`x-app-target-prefix: /providers/private/v1` — and the config it posts (the `x-runtime-config`
+header, no `x-runtime-profile` header at all) is exactly:
 
 ```json
-{ "runCmd": "./typecrate-provider-server", "port": 8800,
+{ "runCmd": "./typecrate-provider-server",
   "artifactPath": "typecrate-provider-server", "probeTimeoutSec": 120,
-  "stopSignal": "SIGTERM",
-  "env": { "TYPECRATE_PROVIDER_VAULT_PATH": "./agentic-provider.json", "RUST_LOG": "info" } }
+  "stopSignal": "SIGTERM", "probePath": "/health",
+  "env": { "TYPECRATE_PROVIDER_VAULT_PATH": "./agentic-provider.json",
+           "TYPECRATE_PROVIDER_HOST": "127.0.0.1", "RUST_LOG": "info" } }
 ```
+
+`config.port` is **absent** unless `--port` names an internal port: v2 auto-allocates one and injects it
+as `PORT`, which the bin honours. The app is served at `<endpoint>/app/provider/…`, and the
+`targetPrefix` makes `/app/provider/models` reach the crate's native `/providers/private/v1/models`.
 
 `scripts/deploy-endpoint.ts:36-40` states the same object as the contract this file is written against;
 `buildPayloadConfig` (`:418-426`) is the code that produces it and
@@ -254,53 +263,88 @@ Why each of those choices, in order:
 
 * **No profile header ⇒ the container's anonymous profile.** `generic` is the profile for a payload
   nobody knows anything about (`services/daytona/sandbox/runtime-server/src/contract.rs`): the allowed config
-  keys are `runCmd, port, probePath, probeTimeoutSec, stopSignal, buildCmd, buildTimeoutSec,
-  artifactPath, env`, the defaults are `port 8080` / `SIGTERM` / `probeTimeoutSec 60`, and it adds no
-  key, no signature and no registry lookup. A tar.gz **must** carry `runCmd` (an archive can hold
-  anything, so the runner refuses to guess — `contract.rs`).
-* **No `probePath` ⇒ readiness is a bare TCP connect** (`contract.rs`), which is the only
-  probe rule that assumes nothing about the payload. Passing `--probe-path /health` is supported and
-  documented, but on a **Modal box it is a trap**: the runner's own routes shadow the service's at
-  `/`, `/health`, `/tools`, `/stats`, `/status`, `/logs`
-  (`services/modal/deploy/sandbox/modal-sandbox-container.py:300`, and the forwarding rules at
-  `:126-131`), so that probe would answer from the **runner**, not from the provider.
-* **`port: 8800`** equals `serve::PROVIDER_PORT` (`src/serve.rs:169`) and the bin's own default. The
-  runner forces `PORT` to the declared port in the child environment (`the Rust runtime-server`
-  `childEnv`, `modal-sandbox-container.py:1895-1899` `_child_env`) and the bin honours `PORT`
-  (`src/bin/server.rs:104`, `:137-139`), so a deploy needs no flag — and `--env PORT=…` is therefore
-  the wrong knob (`portCollisionNotes`, `scripts/deploy-endpoint.ts:446-450`, says so).
+  keys are `runCmd, port, probePath, probeTimeoutSec, stopSignal, stopGraceSec, buildCmd,
+  buildTimeoutSec, artifactPath, env`, the defaults are `SIGTERM` / `probeTimeoutSec 60` and an
+  auto-allocated port, and it adds no key, no signature and no registry lookup. A tar.gz **must**
+  carry `runCmd` (an archive can hold anything, so the runner refuses to guess — `contract.rs`).
+  The app NAME and the TARGET PREFIX are top-level payload metadata (spec §4.7/§8.5), never config
+  keys: `name` is the registry key, and `targetPrefix` is the native base path the gateway prepends
+  after stripping `/app/<name>/`.
+* **Readiness is the bin's own `GET /health`, probed on LOOPBACK.** The v2 runner probes
+  `http://127.0.0.1:<internal port><probePath>` (spec §8.7), so `probePath: "/health"` reaches the
+  bin directly and proves the provider process answered. The route is NOT part of the prefixed native
+  surface: going through the gateway would map `/app/provider/health` to
+  `/providers/private/v1/health`, which the crate does not serve — hence the usage text and the
+  run summary explicitly deny that alias rather than advertising it. `--probe-path` remains available
+  for a different loopback route.
+* **`config.port` is omitted by default.** v2 auto-allocates an internal port and injects it as
+  `PORT` in the child environment; the bin honours `PORT` (`src/bin/server.rs:104`, `:137-139`), so a
+  deploy needs no port at all. `--port <n>` pins one for an operator who wants a fixed internal port,
+  and `--port 0` is the explicit spelling of auto. `PORT` itself is a RESERVED env key (spec
+  R-8.3/R-8.4): the runner rejects a user value with `400 config_invalid`, so the verb refuses
+  `--env PORT=…` locally with the fix (`--port`) instead of shipping a payload that cannot boot.
+* **The bin binds loopback in a deploy.** `config.env` carries
+  `TYPECRATE_PROVIDER_HOST: "127.0.0.1"` (spec R-8.5: the deploy client supplies the app's own
+  host-binding variable), so the runner gateway is the only way in and no other interface exposes the
+  provider. The crate's native default is still `0.0.0.0` for `start:server`; the deploy overrides it.
 * **`stopSignal: SIGTERM`** is the contract's default and the one thing this bin drains cleanly:
   `SIGTERM`, `SIGINT` and Ctrl+C stop it after in-flight requests drain and it exits **0**
   (`src/bin/server.rs:186-188`, verified live).
 * **`probeTimeoutSec: 120`** is above the contract's 60 s default because the first boot has to read
   the vault document and build the registry inside the probe window.
 
-**Anonymity cuts both ways, and one rule follows from it.** The container does not authenticate the
-*caller* — anyone who can reach the URL can use the API, and Modal's box is explicit that it adds no
-token layer of its own (`modal-sandbox-container.py:301-306`) — so authentication is the payload's own
-business: the provider's upstream credentials ride **inside the bundle**. That is also why **no secret
-may go into `config.env`**: `GET /status` echoes the posted config verbatim to a caller that presented
-no secret (`contract.rs`), and `env` therefore carries only the *relative path* to the
-document. `cwd` inside the container is the stage directory, so `./agentic-provider.json` resolves
-(`src/bin/server.rs:156-158`). `--env K=V` is for non-secret wiring only.
+**Anonymity cuts both ways, and one rule follows from it.** Modal's box adds no credential layer of
+its own — `_box_endpoint` passes `requires_proxy_auth=False` (`:1895-1913`) — and the only gate the
+adapter can configure is the runner's own admin auth: `SANDBOX_ADMIN_TOKEN`/`SANDBOX_ADMIN_TOKEN_FILE`
+in the deploy environment (module doc `ADMIN AUTH`, `:48-62`; with neither set, anyone who can reach
+the URL can use the API). So the *caller* is authenticated by the runner or not at all, and the
+provider's upstream credentials are the payload's own business: they ride **inside the bundle**. That
+is also why **no secret may go into `config.env`**: the v2 `AppView` exposes only `envKeys` and
+redacts every VALUE (spec
+R-5.1/R-5.2) while the full config is persisted in `app.json`, so an env value is metadata an operator
+(or anything that can read the app record/logs) can enumerate — and the keys alone already describe a
+credential. `env` therefore carries only the *relative path* to the document. `cwd` inside the
+container is the stage directory, so `./agentic-provider.json` resolves (`src/bin/server.rs:156-158`).
+`--env K=V` is for non-secret wiring only.
+
+**Two independent credentials reach the RUNNER, not the provider.** `--token`
+(`TYPECRATE_PROVIDER_ENDPOINT_TOKEN`) is the Daytona preview token, sent as `x-daytona-preview-token`
+on every call. `--admin-token` / `--admin-token-file` (env
+`TYPECRATE_PROVIDER_SANDBOX_ADMIN_TOKEN`, then `SANDBOX_ADMIN_TOKEN`; the `_FILE` pair likewise) is the
+runner's §12.3 admin Bearer, sent as `Authorization: Bearer` on mutations and app-log reads. The file
+form is preferred, because the value never appears on a command line; `start:daytona` passes that file
+straight to `createSandbox` (uploaded 0600, only its path reaches the runner) while using the resolved
+value for its own HTTP calls. Neither is ever printed: the plan masks the preview token and reports the
+admin credential by presence, and the JSON summary emits `token`/`tokenScope` for the preview token and
+`adminAuth: "bearer"` (presence only) for the admin credential.
 
 **The credential gate is what makes a cloud deploy honest.** In the services host the vault gate is
 soft (503 per route, because that process also serves `/v1/harness`); in the **bin** it runs **before
-the bind** and exits **1** with the regeneration command (`src/bin/server.rs:29-42`). A container
-probes by TCP connect, so a soft-503 listener would pass readiness while serving nothing — a bad
-credential would become a silently-degraded deployment. `--allow-unconfigured` (a bin flag;
+the bind** and exits **1** with the regeneration command (`src/bin/server.rs:29-42`). The runner's
+readiness probe reaches that same process on loopback, so a soft-503 listener would still pass only if
+the process were serving; with the fail-fast gate a bad credential is a *failed* deploy instead of a
+silently-degraded one. `--allow-unconfigured` (a bin flag;
 `deploy:endpoint --allow-unconfigured` appends it to `runCmd`) restores the lazy 503 when booting empty
 is what you asked for. The client-side equivalent for the *credentials file* is the missing-vault error
-(`resolveVaultPath`, `scripts/deploy-endpoint.ts:518-530`), which refuses to ship at all and prints
+(`resolveVaultPath` in `scripts/deploy-endpoint.ts`), which refuses to ship at all and prints
 `yarn workspace @config/vault export -- --consumer agentic-provider`.
 
-**Slot policy is the client's, decided from the endpoint's own `/health`.** A busy slot is resolved
-first (`DELETE /` frees the payload slot; on a box `DELETE /sandbox` replaces the **container** and the
-URL survives, `modal-sandbox-container.py:247-251`). `--no-teardown` turns a busy slot into an error,
-`--teardown` frees it and ships nothing. The verdicts `probeEndpoint` can report are
-`live-modal-box | live-modal-sandbox | live-other | busy | dead` (a `401`/`403` is reported as `dead`
-with a token hint), and every failure path attaches a `GET /logs` tail — which is the only way to see
-*why* a payload died (bind failure, refused vault, `ENOEXEC`).
+**The app policy is the client's, and it is APP-SCOPED.** The verb handshakes the endpoint with
+`GET /health` (a v1 single-slot runner is refused with its own message, R-17.1), reads
+`GET /apps/provider`, and then:
+
+* app absent → `POST /apps` registers it;
+* app `ready`/`failed` → `PUT /apps/provider` replaces it **blue-green**: the current revision keeps
+  serving `/app/provider/` until the new one is ready, and every peer app is untouched;
+* app in any other state (queued/building/booting/draining) → the registry refuses a PUT
+  (`409 app_not_replaceable`), and the run reports that as `busy` rather than forcing it.
+
+`--no-teardown` turns an existing app into an error; `--teardown` is `DELETE /apps/provider` only —
+one app unregistered, the runner and its peers keep serving — and ships nothing. There is **no root
+alias** (`/`), no `default` app name, and no routine whole-box reset: `DELETE /_provider/sandbox` is
+not exposed by this verb at all. Readiness is polled on `GET /apps/provider`, and a failure attaches
+`GET /apps/provider/logs?lines=N`, the only way to see *why* a payload died (bind failure, refused
+vault, `ENOEXEC`).
 
 **Two offline postures, and they are different.** `--dry-run` sends nothing and runs no cargo: it
 resolves the artifact from the candidate list the client derives from the repo-root
@@ -323,71 +367,94 @@ repo-root `Temp/`); absolute paths stay verbatim. Verified with zero outbound ne
 `--out` usable as a build artifact and a reviewable diff).
 
 Every verb prints human lines prefixed `[provider:deploy]` and ends with **exactly one bare JSON line**
-(`buildSummary`, `runtime-deploy.ts:1600-1631`), so `… | tail -1 | jq` works on a success, a failure, a
-teardown and a dry run alike. Exit codes: `0` deployed / planned / slot freed / bundle written,
-`1` everything else — Daytona is never called for a parse error, so a typo cannot cost money.
+(`buildSummary`), so `… | tail -1 | jq` works on a success, a failure, a teardown and a dry run alike.
+Exit codes: `0` deployed / planned / app unregistered / bundle written, `1` everything else — Daytona is
+never called for a parse error, so a typo cannot cost money.
 
 The recorded run of this pass (host offline, artifact from `build:server`):
 
 ```bash
-yarn workspace @typecrate/provider start:modal -- --dry-run    # exit 0, zero network
+yarn workspace @typecrate/provider deploy:endpoint https://box.modal.run --dry-run   # exit 0, zero network
+yarn workspace @typecrate/provider start:daytona -- --dry-run                        # exit 0, zero Daytona calls
 ```
 
-which resolved the vault box, printed the member table (`0755 typecrate-provider-server 3387776`,
-`0644 agentic-provider.json 14956`, `1616953` bytes gzip), the config JSON and its base64url header,
-`readiness: TCP connect within 120s — client budget 240000 ms`, and ended with
-`{"mode":"deploy",…,"status":"planned","port":8800,"profile":"anonymous",…}`. Nothing after that needed
-the network.
+which printed the member table (`0755 typecrate-provider-server 3387328`,
+`0644 agentic-provider.json 14711`, `1616247` bytes gzip), the config JSON and its base64url header,
+`readiness: HTTP 2xx on /health via LOOPBACK within 120s — client budget 240000 ms`, the app identity
+(`"provider"`, native prefix `/providers/private/v1`), and ended with
+`{"mode":"deploy",…,"name":"provider","status":"planned","publicUrl":"https://box.modal.run/app/provider/","path":"/app/provider/","port":0,…}`.
+Nothing after that needed the network.
 
 #### Getting a dedicated box
 
 `start:modal`'s last-resort default is the box this repo already owns —
 `https://devilz-angelz--container-sandbox.us-east.modal.run`, the single entry of
-`config/vault/src/container/modal-container.ts:1-3` — and that box is running another workload. A second
-box is **not** a second copy of the deploy file: as of this pass the identity constants in
-`services/modal/deploy/sandbox/modal-sandbox-container.py` are env-overridable and default to exactly
-today's values, so one copy of the file drives any number of independent single-slot boxes (the header
-block that documents them is `:179-213`).
+`config/vault/src/container/modal-container.ts:1-3` — and that box already serves another workload.
+Under runtime v2 the provider registers beside it as the app `provider`, so a shared box is no longer
+displaced; a second box is still how an operator gets an isolated origin, an isolated admin credential
+and an isolated resource budget. A second box is **not** a second copy of the deploy file: as of this
+pass the identity constants in `services/modal/deploy/sandbox/modal-sandbox-container.py` are
+env-overridable and default to exactly today's values, so one copy of the file drives any number of
+independent boxes (the header block that documents them is the `DRIVER CONFIGURATION` section,
+`:164-191`).
 
-The env names below were **re-read from that file line by line** (`:4304`, `:4308`, `:4314`, `:4320`,
-`_env_ports` at `:4372`, and `:4544`); each row names the constant it sets, so a further renumbering in
-that file — it is edited concurrently — stays visible instead of becoming a silently wrong number:
+The env names below are **named by the constant they set**, not only by a line number: that file is
+edited concurrently, so each row greps `APP_NAME` / `BOX_LABEL` / `TAG_VALUE` / `IMAGE_NAME` to
+re-locate itself. There are exactly four overridable names as of T36 — the spawner label and the
+preview-port list are gone with the Python spawner/forwarder they configured:
 
 | Env var | Constant it sets | Default (= today's shared box) |
 | --- | --- | --- |
-| `SANDBOX_APP_NAME` | `APP_NAME` (`:4304`) | `container-sandbox` |
-| `SANDBOX_BOX_LABEL` | `BOX_LABEL` (`:4544`) | `container-sandbox` |
-| `SANDBOX_SPAWNER_LABEL` | `SPAWNER_LABEL` (`:4308`) | `container-sandbox-spawner` |
-| `SANDBOX_TAG_VALUE` | `TAG_VALUE` (`:4314`; `TAG_KEY = "service"` at `:4313` is deliberately not overridable) | `container-sandbox` |
-| `SANDBOX_IMAGE_NAME` | `IMAGE_NAME` (`:4320`) | `container-sandbox-toolchain` |
-| `SANDBOX_PREVIEW_PORTS` | `SANDBOX_PREVIEW_PORTS` (`:4392`, parsed by `_env_ports` at `:4372`) | `(8085,)` |
+| `SANDBOX_APP_NAME` | `APP_NAME` (`:177`) | `container-sandbox` |
+| `SANDBOX_BOX_LABEL` | `BOX_LABEL` (`:345`) | `container-sandbox` |
+| `SANDBOX_TAG_VALUE` | `TAG_VALUE` (`:182`; `TAG_KEY = "service"` at `:181` is deliberately not overridable) | `container-sandbox` |
+| `SANDBOX_IMAGE_NAME` | `IMAGE_NAME` (`:191`) | `container-sandbox-toolchain` |
 
 Facts an operator needs, each verified against that file:
 
 1. **The URL is derived, not typed.** A Modal web-function deployment answers at
-   `https://<source>--<BOX_LABEL>.modal.run` (`:4539-4543` states it, and the vault entry above is the
-   live example: source `devilz-angelz`, label `container-sandbox`). Change `SANDBOX_BOX_LABEL`, get a
-   new URL.
-2. **The names are read at import time** — `modal.App(APP_NAME)` (`:5591`) and the box's
-   `web_server(label = BOX_LABEL)` are evaluated while the module is imported, so the variables have to
-   be in the environment of the process that runs the deploy.
+   `https://<source>--<BOX_LABEL>.modal.run` (the `BOX_LABEL` comment at `:343-345` states it, and the
+   vault entry above is the live example: source `devilz-angelz`, label `container-sandbox`). Change
+   `SANDBOX_BOX_LABEL`, get a new URL.
+2. **The names are read at import time** — `modal.App(APP_NAME)` (`:1963`) and the box's
+   `web_server(label = BOX_LABEL)` (`_box_endpoint`) are evaluated while the module is imported, so the
+   variables have to be in the environment of the process that runs the deploy.
 3. **The command shape** is unchanged: `python3 services/modal/deploy/sandbox/modal-sandbox-container.py`
    (or `modal deploy <that file>`), and `--dry-run` on it prints the identity **this** process resolved
-   (app, box label, spawner label, image, ports) without touching Modal.
+   (app, box label, image, the named-images capability, and the two separate admin credentials)
+   without touching Modal.
 4. **`--cpu` / `--mem` do not size a box.** A web function's resource request is part of the module-level
    declaration, so those flags size a *sandbox*; the CLI says so when you pass them for a box deploy
-   (`:290`, `:6303-6304` `--cpu`/`--mem`, `:6391-6396` the sizes note) and the box's numbers are the
+   (`--cpu`/`--mem` at `:2690-2691`, the sizes note at `:2778-2783`) and the box's numbers are the
    import-time constants (`CPU_CORES` / `MEMORY_MIB`).
-5. **Runtime port 8800 breaks nothing on a box.** A box forwards exactly one port (the runner's) and
-   relays **every non-contract path** to whichever runtime is ready (`:126-131`, `:167`, `:292`), so
-   `https://<source>--<label>.modal.run/providers/private/v1/models` reaches 8800 with no extra setup.
-   What port 8800 does change is `preview.url` **bookkeeping**: the deploy step publishes preview URLs
-   for `SANDBOX_PREVIEW_PORTS` only (`_publish_box_previews`, `:6090-6098`), so `/status` may report the
-   preview URL late or not at all and the runner attaches a `preview.warning` (`:1710-1724`). Add the
-   port — `SANDBOX_PREVIEW_PORTS=8085,8800` — if you want it echoed.
-6. **One per-checkout caveat:** `--url` and `--down` read a scratch deploy pointer
+5. **The provider's internal port is irrelevant to the public URL.** A box forwards exactly one port —
+   the runner's 7777, declared on the Function by `web_server(...)` (`_box_endpoint`) — and serves
+   every app through the v2 gateway at `/app/<name>/` (spec §4.1/§4.2), so
+   `https://<source>--<label>.modal.run/app/provider/models` reaches the provider's native
+   `/providers/private/v1/models` through `targetPrefix`, with no port published and no extra box
+   setup. There is no preview-port list, no spawner label and no per-app forwarder to configure: the
+   endpoint is ONE origin, the module docstring's `THE ENDPOINT IS ONE ORIGIN` block (`:10-17`) is the
+   whole port map, readiness is the bin's `/health` on loopback, and clients use the mount.
+6. **Admin auth has TWO carriers, and they are not interchangeable.**
+   `SANDBOX_ADMIN_TOKEN` / `SANDBOX_ADMIN_TOKEN_FILE` in the deploy process's **environment** is what
+   the import-time box Function secret carries into the box container; a `--token` /
+   `--admin-token-file` on the CLI applies to SANDBOX creates only. `--dry-run` prints the two states
+   on separate lines for exactly that reason. Sandbox creates carry the value as a Modal `Secret`
+   (the whole runner configuration collapses into that one Secret on a client without `env`), the
+   value is never printed, and every `/health` gate requires
+   `authRequired == (an admin token is configured here)` — a container whose auth disagrees with the
+   host credential is terminated (fresh create) or skipped (reuse), never handed back.
+7. **The named image is a publish target, not a create input.** `--image`/`deploy_service`/every
+   create path build the CURRENT crate+dashboard layers and publish them under `IMAGE_NAME`
+   (Modal client ≥ 1.5); containers are created from the built image object, so a publish that is
+   behind the checkout can never be what a new sandbox runs. A plain `modal deploy` builds the marker
+   Function's image but does **not** publish the name, and a client without the named-images API
+   (Modal 1.1.x) prints "no named images; builds on first create/deploy" from `--image` and exits 0.
+   `--start` may still REUSE a running idle container, which keeps whatever image it started from —
+   pass `--fresh` for one built from current local inputs.
+8. **One per-checkout caveat:** `--url` and `--down` read a scratch deploy pointer
    (`Temp/modal-sandbox-container/last-deploy.json`), which two boxes driven from the same checkout
-   would share (`:210-213`).
+   would share (`_state_path`, `:2157-2164`).
 
 Then point the verb at the new box, without editing the repo:
 
@@ -801,28 +868,25 @@ The two TypeScript gates are separate, and they only exist **inside the monorepo
 
 ```bash
 yarn tsc --noEmit -p packages/typecrate/provider              # exit 0 (from the repo root)
-yarn vitest run packages/typecrate/provider/scripts           # 86 passed / 3 files, no network, no cargo
+yarn vitest run packages/typecrate/provider/scripts           # 101 passed / 3 files, no network, no cargo
 npx eslint <the four scripts/*.ts>                            # 0 problems (`*.test.ts` is eslint-ignored,
                                                               #   eslint.config.mjs:17)
 ```
 
-The deploy path was verified **as far as an offline host can take it**: `start:modal -- --dry-run`
-exits 0 and prints the real 1,616,953-byte bundle, the member table with its modes, the config JSON and
-its base64url header (the run is quoted under [Deploying it](#deploying-it-the-three-verbs)). What was
-**not** performed on this pass: a real `POST /` to a live box (that needs the network, and this repo's
-box is occupied by another workload), so the end-to-end deploy of *this* payload is unverified here —
-the contract behaviour it depends on is verified on the client side
-(`yarn vitest run services/daytona/sandbox` — 216 tests in 3 files, of which the deploy client's own file
-`runtime-deploy.test.ts` is 75) and in
-`services/modal/deploy/sandbox/modal-sandbox-container.py`, which this task only reads.
+The deploy path was verified **as far as an offline host can take it**: `deploy:endpoint <url>
+--dry-run` and `start:daytona -- --dry-run` both exit 0 and print the real 1,616,247-byte bundle, the
+member table with its modes, the v2 app identity (`provider`, `targetPrefix /providers/private/v1`), the
+config JSON and its base64url header (the run is quoted under
+[Deploying it](#deploying-it-the-three-verbs)). What was **not** performed on this pass: a real
+`POST /apps` / `PUT /apps/provider` against a live v2 box (that needs the network), so live provider
+conformance is unverified here — the v2 routes, headers and polling are pinned on the client side
+(`yarn vitest run services/daytona/sandbox`, which includes the v2 conformance suites) and in
+`services/daytona/sandbox-specs.md`, which this task only reads.
 
-Everything else this pass ran was read-only: `git status`/`grep`/`find`/`sed`/`stat`, plus the two
-cargo test-target counts re-derived by grep. Every `file:line` cited in both files was opened and read
-on this pass; the one **cite drift** found in the scripts (the Modal container file, whose line numbers
-moved when its identity constants became env-overridable) was corrected in place rather than repeated —
-`scripts/deploy-endpoint.ts:150-157` (the `DEFAULT_PORT` doc, whose drifted cite sits at `:154-155`),
-`:438-445` (the `portCollisionNotes` doc, cite at `:441-442`) and `scripts/start-modal.ts:27-30` (the
-"A SECOND BOX" comment, cite at `:29`) — each pointer now names **the declaration the cite lives in**, not a
-bare line, because the two read-only files those cites point AT (`services/daytona/sandbox/runtime-server/src/contract.rs`
-and the Modal container file) are edited elsewhere in this session and renumber again; a number goes
-silently wrong, a symbol name stays greppable.
+Everything else this pass ran was read-only: `git status`/`grep`/`find`/`sed`/`stat`. The v1 wording this
+pass removed from the verbs is called out in `knowledge.md`'s ledger (row 14), and every deploy-shaped
+sentence in this file now names the v2 route, the app name, the `targetPrefix` or the loopback probe
+rather than a v1 slot/port. Script-side pointers name the **declaration** (`DEFAULT_PROBE_PATH`,
+`APP_NAME`, `TARGET_PREFIX`, `resolveAdminToken`) instead of a line, because the shared client and the
+Modal container file are edited elsewhere in this session and renumber again; a number goes silently
+wrong, a symbol name stays greppable.

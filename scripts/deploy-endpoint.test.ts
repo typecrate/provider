@@ -1,37 +1,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  deploy-endpoint.test.ts — the provider's own deploy verb, end to end, with ZERO
-//  network, ZERO cargo spawn and ZERO real filesystem.
+//  network, ZERO cargo spawn and ZERO real filesystem, against sandbox runtime v2.
 //
 //  Everything side-effectful in deploy-endpoint.ts arrives through `ProviderDeps`
 //  (the shared client's RuntimeDeps — probe / runCommand / fs / env / log / error —
 //  plus the writeFile seam), so these tests drive the REAL control flow against
 //  scripted endpoint answers and assert exact values:
-//    · parser      — every default, the positional endpoint, the env fallbacks and
-//                    their precedence, the --env accumulation (values may contain `=`),
-//                    each range check, each contradiction (--teardown + a shipping knob,
-//                    two endpoints), and `--out` with no endpoint = package-only
-//    · payload     — the FIXED config contract, key for key: no `probePath` unless asked
-//                    for, `./typecrate-provider-server` as runCmd, the two env defaults
-//                    and --env overriding them, and the two members WITH their modes —
-//                    read back OUT of the real gzip'd tar with the client's own reader
-//    · cargo       — the client's exact argv (no `--bin`: the package target builds the
-//                    bin), that a dry run spawns NOTHING, and that it resolves the
-//                    artifact from the repo-root .cargo/config.toml target-dir instead
-//    · vault       — a missing or empty artifact fails with the crate's regeneration
-//                    command and WITHOUT a probe: no deploy is attempted with a payload
-//                    that cannot authenticate itself
-//    · flow        — a dry run touches no network but prints the members + the config and
-//                    ends with the machine summary; a real run preflights /health +
-//                    /status, resolves a busy slot with DELETE /, POSTs with NO
-//                    x-runtime-profile and the config header byte-identical to
-//                    encodeConfigHeader, waits, and prints the summary LAST; --out writes
-//                    bytes without deploying and anchors a RELATIVE value on the REPO root,
-//                    never on the cwd; --teardown ships nothing
-//    · entry       — the guard's three rules, including that start-modal.ts importing
-//                    this verb must NOT fire this verb's guard
-//
-//  Nothing asserts a range where an exact value is knowable: the member tables, the
-//  header sets, the probe sequences and the byte counts below are compared to literals.
+//    · parser      — the auto port (undefined, `--port 0` too), the env/flag admin
+//                    credential pair, the reserved `env.PORT` refusal, every range
+//                    check, and `--out` with no endpoint = package-only
+//    · payload     — the v2 fixed contract, key for key: app name "provider", top-level
+//                    targetPrefix "/providers/private/v1", NO config.port unless asked,
+//                    probePath "/health" (the bin's loopback route), and the env triple
+//                    including TYPECRATE_PROVIDER_HOST=127.0.0.1 and never PORT
+//    · registry    — POST /apps on create, PUT /apps/provider blue-green on replace,
+//                    GET /apps/provider for readiness, DELETE /apps/provider for
+//                    teardown, GET /apps/provider/logs for the failure tail, and the
+//                    x-app-name / x-app-target-prefix upload headers
+//    · auth        — the Daytona preview token and the runner ADMIN bearer travel
+//                    together but stay separate; the admin value never reaches a log
+//    · urls        — the provider base is endpoint + /app/provider/ (never a per-port
+//                    link), and /app/provider/health is NOT advertised as health
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { join, resolve } from 'node:path';
@@ -41,15 +30,25 @@ import { DEFAULT_LOG_LINES, encodeConfigHeader, readTarBundle } from '@services/
 import type { FsAccess, Probe, ProbeResult } from '@services/daytona/sandbox';
 
 import {
+    ADMIN_TOKEN_ENV,
+    ADMIN_TOKEN_FILE_ENV,
+    APP_NAME,
+    APP_PATH,
     DEFAULT_PORT,
+    DEFAULT_PROBE_PATH,
     DEFAULT_PROBE_TIMEOUT_SEC,
     DEFAULT_VAULT_PATH,
     ENDPOINT_ENV,
+    GENERIC_ADMIN_TOKEN_ENV,
+    GENERIC_ADMIN_TOKEN_FILE_ENV,
     PACKAGE_ROOT,
     PAYLOAD_FILENAME,
     PREFIX,
+    PROVIDER_HOST_ENV,
+    PROVIDER_HOST_LOOPBACK,
     REPO_ROOT,
     SERVER_MEMBER,
+    TARGET_PREFIX,
     TOKEN_ENV,
     VAULT_MEMBER,
     VAULT_REGENERATION_COMMAND,
@@ -64,7 +63,9 @@ import {
     buildRunCmd,
     main,
     parseArgs,
-    portCollisionNotes,
+    reservedEnvErrors,
+    resolveAdminToken,
+    resolveAdminTokenFile,
     resolveOutPath,
     resolveVaultPath,
     runDeployEndpoint,
@@ -126,13 +127,34 @@ const fakeCargo = (stdout = cargoJson(CARGO_TARGET_BIN)) => {
 
 const OK = (json: unknown): ProbeResult => ({ status: 200, ok: true, json, text: JSON.stringify(json) });
 const ACCEPTED = (json: unknown): ProbeResult => ({ status: 202, ok: true, json, text: JSON.stringify(json) });
-const REMOVED = (): ProbeResult => OK({ tornDown: true });
+const MISSING = (json: unknown = { error: 'app_not_found' }): ProbeResult => ({ status: 404, ok: false, json, text: JSON.stringify(json) });
 
-/** The runner's /health, and the three /states a deploy meets. */
-const HEALTH = { ok: true, slot: 'empty', uptimeSec: 5, contract: 'daytona-runtime-v1', runnerPort: 7777, authenticated: false, exposedPorts: [7777] };
-const STATUS_EMPTY = { slot: 'empty', runtime: null };
-const STATUS_BUSY = { slot: 'ready', runtime: { profile: 'generic', port: 8080, ready: true, runtimeId: 'rt-old', preview: { url: 'https://box.modal.run' } } };
-const STATUS_READY = { slot: 'ready', runtime: { profile: 'generic', port: DEFAULT_PORT, ready: true, runtimeId: 'rt-new', preview: { url: 'https://box.modal.run' } } };
+/**
+ * The v2 runner handshake. `authRequired: true` + the `admin-auth` capability is the
+ * shape a sandbox created with SANDBOX_ADMIN_TOKEN reports.
+ */
+const HEALTH = { ok: true, contract: 'sandbox-runtime-v2', apiVersion: 2, capabilities: ['apps'], authRequired: false, uptimeSec: 5, runnerPort: 7777 };
+const HEALTH_ADMIN = { ...HEALTH, capabilities: ['apps', 'admin-auth'], authRequired: true };
+
+/** A registry AppView, as GET /apps/provider reports it. */
+const APP_READY = {
+    name: APP_NAME,
+    revision: 1,
+    path: APP_PATH,
+    publicUrl: 'https://box.modal.run/app/provider/',
+    internalPort: 20043,
+    targetPrefix: TARGET_PREFIX,
+    profile: 'anonymous',
+    filename: PAYLOAD_FILENAME,
+    status: 'ready',
+    ready: true,
+    error: null,
+    lastReplaceError: null,
+    pending: null,
+    queue: null,
+    lastProbe: null,
+};
+const APP_FAILED = { ...APP_READY, status: 'failed', ready: false, error: 'vault document refused', internalPort: 20043 };
 
 /**
  * A scripted endpoint: each call must be in the script, in order per method+URL, and an
@@ -192,13 +214,7 @@ const flagsFor = (argv: readonly string[]): ProviderFlags => parseArgs(argv, {})
  * WHY THIS EXISTS: the bug this file pins is that a RELATIVE `--out Temp/x.tar.gz` used
  * to resolve against the cwd, and vitest happens to run with the cwd AT the repo root —
  * so an expectation written as `resolve('Temp/x.tar.gz')` is the same string either way
- * and cannot fail. The real shape of the bug is cwd = the PACKAGE directory, which is
- * where `yarn workspace @typecrate/provider deploy:endpoint` starts (root AGENTS.md,
- * "Scratch Space — use repo-root `Temp/`"): there, cwd-relative resolution lands
- * `packages/typecrate/provider/Temp/`. Faking the cwd makes the two behaviours produce
- * different strings, which is the only way these tests can tell them apart.
- * `node:path`'s `resolve()` reads `process.cwd()` per call, so the spy reaches it, and
- * the restore is in a `finally` so a throwing test cannot leak the fake cwd into others.
+ * and cannot fail. Faking the cwd makes the two behaviours produce different strings.
  */
 const withCwd = async <T>(cwd: string, run: () => T | Promise<T>): Promise<T> => {
     const spy = vi.spyOn(process, 'cwd').mockImplementation(() => cwd);
@@ -213,47 +229,52 @@ const withCwd = async <T>(cwd: string, run: () => T | Promise<T>): Promise<T> =>
 const lastJson = (lines: string[]): Record<string, unknown> => JSON.parse(lines[lines.length - 1]!) as Record<string, unknown>;
 
 /**
- * The canonical WIRE form of the fixed config. The client re-serialises config through
- * its own defaults before encoding the header (runtime-deploy.ts `buildConfigHeader`), so
- * the key ORDER on the wire is the client's, not the declaration order in
- * `buildPayloadConfig`. This string is that canonical text, pinned so a change in either
- * serialiser surfaces here; the SEMANTIC contract (key for key) is pinned independently by
- * the decoded-header assertion in the deploy test below.
+ * The canonical WIRE form of the default config. The client re-serialises config through
+ * its own defaults before encoding the header, so the key ORDER on the wire is the
+ * client's, not the declaration order in `buildPayloadConfig`. This string is that
+ * canonical text, pinned so a change in either serialiser surfaces here; the SEMANTIC
+ * contract is pinned independently by the decoded-header assertion below.
  */
-const CANONICAL_CONFIG_JSON = '{"runCmd":"./typecrate-provider-server","stopSignal":"SIGTERM","port":8800,"probeTimeoutSec":120,"artifactPath":"typecrate-provider-server","env":{"TYPECRATE_PROVIDER_VAULT_PATH":"./agentic-provider.json","RUST_LOG":"info"}}';
+const CANONICAL_CONFIG_JSON =
+    '{"runCmd":"./typecrate-provider-server","stopSignal":"SIGTERM","probeTimeoutSec":120,"probePath":"/health","artifactPath":"typecrate-provider-server","env":{"TYPECRATE_PROVIDER_VAULT_PATH":"./agentic-provider.json","TYPECRATE_PROVIDER_HOST":"127.0.0.1","RUST_LOG":"info"}}';
 
-/** The exact dry-run note list the shared client produces for THIS config. */
+/** The exact dry-run note list the shared client produces for THIS payload. */
 const plannedNotes = (endpoint: string, bytes: number): string[] => [
     // The client's format guard runs before anything is sent, and its note leads the list.
     'format guard: "typecrate-provider-server" is a Linux ELF',
-    'dry run — no probe, no DELETE, no POST, no cargo',
-    `POST ${endpoint}/ — ${bytes} bytes as "typecrate-provider.tar.gz", profile anonymous`,
-    // The header note carries the base64url AND the inline JSON of the same object.
+    'dry run — no probe, no PUT, no POST, no cargo',
+    `POST ${endpoint}/apps — ${bytes} bytes as "typecrate-provider.tar.gz", app "provider", targetPrefix "/providers/private/v1", profile anonymous`,
     `x-runtime-config: ${encodeConfigHeader(JSON.parse(CANONICAL_CONFIG_JSON) as object)} (base64url JSON of ${CANONICAL_CONFIG_JSON})`,
-    // No token in this run, so the client says the header was not sent at all.
-    'auth: (not sent — anonymous endpoint)',
+    'auth: preview token not sent; admin bearer not sent',
+    `public base URL: ${endpoint}/app/provider/ (endpoint + registry path /app/provider/)`,
     // probeTimeoutSec 120 + the client's own 120 s slack, no build step: 240 000 ms.
-    'readiness budget: 240000 ms derived from the payload\'s own timeouts',
-    'slot policy: a busy slot is resolved first (DELETE /, or DELETE /sandbox on a Modal box)',
+    "readiness budget: 240000 ms derived from the app's own timeouts",
+    'replace policy: an existing app is replaced blue-green with PUT /apps/provider (it keeps serving /app/provider/ until the new revision is ready)',
 ];
+
+/** The public base of the box these flow tests deploy to. */
+const BOX = 'https://box.modal.run';
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  PARSER
 // ══════════════════════════════════════════════════════════════════════════════
 
 describe('parseArgs', () => {
-    it('starts from the provider payload contract, not from a neutral default', () => {
-        const { flags, errors } = parseArgs(['https://box.modal.run']);
+    it('starts from the v2 payload contract: no port, loopback readiness, no admin credential', () => {
+        const { flags, errors } = parseArgs([BOX]);
         expect(errors).toEqual([]);
-        expect(flags).toEqual({
+        expect(flags).toStrictEqual({
             help: false,
             dryRun: false,
             teardownOnly: false,
             replace: true,
-            endpoint: 'https://box.modal.run',
+            endpoint: BOX,
             token: '',
-            port: 8800,
-            probePath: '',
+            adminToken: '',
+            adminTokenFile: '',
+            // v2: absent = the runner auto-allocates.
+            port: undefined,
+            probePath: '/health',
             env: {},
             vault: join(REPO_ROOT, 'config', 'vault', 'generated', 'agentic-provider.json'),
             out: '',
@@ -263,15 +284,29 @@ describe('parseArgs', () => {
             logsLines: 40,
             allowUnconfigured: false,
         });
-        // The pins that must never drift from the crate are stated once, here.
-        expect(DEFAULT_PORT).toBe(8800);
+        // The pins that must never drift are stated once, here.
+        expect(APP_NAME).toBe('provider');
+        expect(APP_PATH).toBe('/app/provider/');
+        expect(TARGET_PREFIX).toBe('/providers/private/v1');
+        expect(DEFAULT_PROBE_PATH).toBe('/health');
         expect(DEFAULT_PROBE_TIMEOUT_SEC).toBe(120);
         expect(DEFAULT_LOG_LINES).toBe(40);
+        // The crate's own native default — documented, never applied to the payload.
+        expect(DEFAULT_PORT).toBe(8800);
+        expect(PROVIDER_HOST_ENV).toBe('TYPECRATE_PROVIDER_HOST');
+        expect(PROVIDER_HOST_LOOPBACK).toBe('127.0.0.1');
         expect(DEFAULT_VAULT_PATH).toBe(join(REPO_ROOT, 'config', 'vault', 'generated', 'agentic-provider.json'));
         expect(PACKAGE_ROOT).toBe(join(REPO_ROOT, 'packages', 'typecrate', 'provider'));
     });
 
-    it('reads the endpoint and the token from the documented environment', () => {
+    it('omits config.port by default, treats --port 0 as auto, and honours an explicit port', () => {
+        expect(flagsFor([BOX]).port).toBeUndefined();
+        expect(flagsFor([BOX, '--port', '0']).port).toBeUndefined();
+        expect(flagsFor([BOX, '--port', '9000']).port).toBe(9000);
+        expect(parseArgs([BOX, '--port', '65536']).errors).toEqual(['--port "65536" is out of range (internal TCP port 0-65535, 0 = auto)']);
+    });
+
+    it('reads the endpoint and the preview token from the documented environment', () => {
         const { flags, errors } = parseArgs([], { [ENDPOINT_ENV]: 'https://env.modal.run', [TOKEN_ENV]: 's3cret' });
         expect(errors).toEqual([]);
         expect(flags.endpoint).toBe('https://env.modal.run');
@@ -280,25 +315,59 @@ describe('parseArgs', () => {
         expect(TOKEN_ENV).toBe('TYPECRATE_PROVIDER_ENDPOINT_TOKEN');
     });
 
-    it('lets the command line beat the environment', () => {
-        const { flags } = parseArgs(['https://arg.modal.run'], { [ENDPOINT_ENV]: 'https://env.modal.run' });
-        expect(flags.endpoint).toBe('https://arg.modal.run');
+    it('reads the ADMIN bearer from its own package env, then the generic Daytona name', () => {
+        expect(parseArgs([], { [ENDPOINT_ENV]: BOX, [ADMIN_TOKEN_ENV]: 'env-admin' }).flags.adminToken).toBe('env-admin');
+        expect(parseArgs([], { [ENDPOINT_ENV]: BOX, [ADMIN_TOKEN_ENV]: '', [GENERIC_ADMIN_TOKEN_ENV]: 'generic-admin' }).flags.adminToken).toBe('generic-admin');
+        expect(parseArgs([], { [ENDPOINT_ENV]: BOX, [ADMIN_TOKEN_FILE_ENV]: '/host/a.token' }).flags.adminTokenFile).toBe('/host/a.token');
+        expect(parseArgs([], { [ENDPOINT_ENV]: BOX, [GENERIC_ADMIN_TOKEN_FILE_ENV]: '/host/b.token' }).flags.adminTokenFile).toBe('/host/b.token');
+        // The two credentials never share a variable, and the preview token is not enough.
+        expect(parseArgs([], { [ENDPOINT_ENV]: BOX, [TOKEN_ENV]: 'preview-only' }).flags.adminToken).toBe('');
+        expect(ADMIN_TOKEN_ENV).toBe('TYPECRATE_PROVIDER_SANDBOX_ADMIN_TOKEN');
+        expect(ADMIN_TOKEN_FILE_ENV).toBe('TYPECRATE_PROVIDER_SANDBOX_ADMIN_TOKEN_FILE');
+        expect(GENERIC_ADMIN_TOKEN_ENV).toBe('SANDBOX_ADMIN_TOKEN');
+        expect(GENERIC_ADMIN_TOKEN_FILE_ENV).toBe('SANDBOX_ADMIN_TOKEN_FILE');
+    });
+
+    it('refuses two admin credentials at once — the caller picks one', () => {
+        expect(parseArgs([BOX, '--admin-token', 'a', '--admin-token-file', '/host/a.token']).errors).toEqual([
+            '--admin-token and --admin-token-file are mutually exclusive — pass ONE (the file form is preferred: the value never reaches a command line)',
+        ]);
+        // The same contradiction through the environment is caught before any probe.
+        expect(parseArgs([BOX], { [ADMIN_TOKEN_ENV]: 'a', [ADMIN_TOKEN_FILE_ENV]: '/host/a.token' }).errors).toEqual([
+            '--admin-token and --admin-token-file are mutually exclusive — pass ONE (the file form is preferred: the value never reaches a command line)',
+        ]);
+    });
+
+    it('refuses a RESERVED env key locally, with the real knob in the message', () => {
+        // v2 R-8.3/R-8.4: a user PORT is a hard 400, so it must never be shipped.
+        expect(parseArgs([BOX, '--env', 'PORT=9100']).errors).toEqual([
+            '--env PORT=9100 is RESERVED: the runner injects PORT from the app\'s internal port and rejects a user value with 400 config_invalid — pass --port <n> (0 or omitted = auto-allocate) instead',
+        ]);
+        expect(parseArgs([BOX, '--env', 'APP_NAME=x']).errors).toEqual(['--env APP_NAME=… is RESERVED: the runner owns APP_NAME and rejects a user value with 400 config_invalid — drop it']);
+        expect(parseArgs([BOX, '--env', 'APP_REGISTRY_URL=x']).errors).toEqual(['--env APP_REGISTRY_URL=… is RESERVED: the runner owns APP_REGISTRY_URL and rejects a user value with 400 config_invalid — drop it']);
+        // …and the rejected key never lands in the payload.
+        expect(parseArgs([BOX, '--env', 'PORT=9100']).flags.env).toEqual({});
+        expect(reservedEnvErrors({ PORT: '1', RUST_LOG: 'debug' })).toEqual([
+            '--env PORT=1 is RESERVED: the runner injects PORT from the app\'s internal port and rejects a user value with 400 config_invalid — pass --port <n> (0 or omitted = auto-allocate) instead',
+        ]);
+        expect(reservedEnvErrors({ RUST_LOG: 'debug' })).toEqual([]);
     });
 
     it('accumulates --env and keeps everything after the first = in the value', () => {
-        const { flags, errors } = parseArgs(['https://x', '--env', 'RUST_LOG=debug', '--env', 'DSN=url://a=b']);
+        const { flags, errors } = parseArgs([BOX, '--env', 'RUST_LOG=debug', '--env', 'DSN=url://a=b']);
         expect(errors).toEqual([]);
         expect(flags.env).toEqual({ RUST_LOG: 'debug', DSN: 'url://a=b' });
     });
 
     it('reports each bad token instead of throwing', () => {
-        expect(parseArgs(['https://x', '--nope']).errors).toEqual(['unknown flag "--nope"']);
-        expect(parseArgs(['https://x', 'https://y']).errors).toEqual(['unexpected extra argument "https://y" — the endpoint is the only positional (got "https://x" already)']);
-        expect(parseArgs(['https://x', '--port', '70000']).errors).toEqual(['--port "70000" is out of range (TCP port 1-65535)']);
-        expect(parseArgs(['https://x', '--logs', '0']).errors).toEqual(['--logs "0" is out of range (1-1000 lines)']);
-        expect(parseArgs(['https://x', '--probe-path', 'health']).errors).toEqual(['--probe-path must start with "/" (or omit it for TCP-connect readiness), got "health"']);
-        expect(parseArgs(['https://x', '--env', 'NOEQUALS']).errors).toEqual(['--env expects KEY=VALUE, got "NOEQUALS"']);
-        expect(parseArgs(['https://x', '--token']).errors).toEqual(['--token needs a value']);
+        expect(parseArgs([BOX, '--nope']).errors).toEqual(['unknown flag "--nope"']);
+        expect(parseArgs([BOX, 'https://y']).errors).toEqual(['unexpected extra argument "https://y" — the endpoint is the only positional (got "https://box.modal.run" already)']);
+        expect(parseArgs([BOX, '--logs', '0']).errors).toEqual(['--logs "0" is out of range (1-1000 lines)']);
+        expect(parseArgs([BOX, '--probe-path', 'health']).errors).toEqual(['--probe-path must start with "/" (it is an absolute route on the app\'s loopback listener), got "health"']);
+        expect(parseArgs([BOX, '--env', 'NOEQUALS']).errors).toEqual(['--env expects KEY=VALUE, got "NOEQUALS"']);
+        expect(parseArgs([BOX, '--token']).errors).toEqual(['--token needs a value']);
+        expect(parseArgs([BOX, '--admin-token']).errors).toEqual(['--admin-token needs a value']);
+        expect(parseArgs([BOX, '--admin-token-file']).errors).toEqual(['--admin-token-file needs a value']);
     });
 
     it('refuses two endpoints that disagree, and accepts the same one twice', () => {
@@ -307,20 +376,18 @@ describe('parseArgs', () => {
     });
 
     it('lets the command line beat TYPECRATE_PROVIDER_ENDPOINT, which is only a default', () => {
-        // The env var seeds flags.endpoint, so it MUST NOT take part in the disagreement
-        // check: `start:modal https://second--box.modal.run` with the repo's box in the
-        // environment is the documented way to aim at another box, not a contradiction.
         const positional = parseArgs(['https://second--box.modal.run'], { [ENDPOINT_ENV]: 'https://repo-box.modal.run' });
         expect(positional.errors).toEqual([]);
         expect(positional.flags.endpoint).toBe('https://second--box.modal.run');
         expect(parseArgs(['--endpoint', 'https://flag.run'], { [ENDPOINT_ENV]: 'https://repo-box.modal.run' }).flags.endpoint).toBe('https://flag.run');
-        // An explicit pair that disagrees is still an error, env or no env.
-        expect(parseArgs(['https://a.run', '--endpoint', 'https://b.run'], { [ENDPOINT_ENV]: 'https://a.run' }).errors).toEqual(['two different endpoints given: "https://a.run" and --endpoint "https://b.run"']);
     });
 
-    it('refuses a --teardown that also carries shipping knobs', () => {
-        expect(parseArgs(['https://x', '--teardown', '--port', '9100', '--env', 'A=1']).errors).toEqual(['--teardown ships nothing, so --port / --env do not apply (drop them, or drop --teardown)']);
-        expect(parseArgs(['https://x', '--teardown']).errors).toEqual([]);
+    it('refuses a --teardown that also carries shipping knobs, but keeps the admin credential', () => {
+        expect(parseArgs([BOX, '--teardown', '--port', '9100', '--env', 'A=1']).errors).toEqual(['--teardown ships nothing, so --port / --env do not apply (drop them, or drop --teardown)']);
+        expect(parseArgs([BOX, '--teardown']).errors).toEqual([]);
+        // DELETE /apps/provider is still an authenticated mutation, so the admin bearer
+        // (and the preview token) must survive --teardown.
+        expect(parseArgs([BOX, '--teardown', '--admin-token', 'at', '--token', 'pt']).errors).toEqual([]);
     });
 
     it('treats --out with no endpoint as the package-only verb', () => {
@@ -337,59 +404,60 @@ describe('parseArgs', () => {
     it('lets --help win over a broken command line', () => {
         const { flags, errors } = parseArgs(['--nope', '--help']);
         expect(flags.help).toBe(true);
-        // main() prints USAGE and returns 0 without ever looking at these.
         expect(errors).toEqual(['unknown flag "--nope"']);
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  THE PAYLOAD — the fixed contract, asserted as one literal per shape
+//  THE PAYLOAD — the fixed v2 contract, asserted as one literal per shape
 // ══════════════════════════════════════════════════════════════════════════════
 
 describe('buildPayloadConfig', () => {
-    it('is exactly the anonymous payload the container contract asks for', () => {
-        const config = buildPayloadConfig(flagsFor(['https://x']));
+    it('is exactly the anonymous v2 payload the container contract asks for', () => {
+        const config = buildPayloadConfig(flagsFor([BOX]));
         expect(config).toEqual({
             runCmd: './typecrate-provider-server',
-            port: 8800,
-            artifactPath: 'typecrate-provider-server',
-            probeTimeoutSec: 120,
-            stopSignal: 'SIGTERM',
-            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', RUST_LOG: 'info' },
-        });
-        // `probePath` is ABSENT, not empty: its absence IS the TCP-readiness choice.
-        expect(Object.keys(config)).not.toContain('probePath');
-    });
-
-    it('adds probePath only when the operator opts into HTTP readiness', () => {
-        expect(buildPayloadConfig(flagsFor(['https://x', '--probe-path', '/health']))).toEqual({
-            runCmd: './typecrate-provider-server',
-            port: 8800,
             artifactPath: 'typecrate-provider-server',
             probeTimeoutSec: 120,
             stopSignal: 'SIGTERM',
             probePath: '/health',
-            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', RUST_LOG: 'info' },
+            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', TYPECRATE_PROVIDER_HOST: '127.0.0.1', RUST_LOG: 'info' },
         });
+        // v2 auto-allocates: an absent port is the documented choice, not an empty value.
+        expect(Object.keys(config)).not.toContain('port');
+        // The v1 PORT escape hatch is gone, and a user value cannot even reach here.
+        expect(Object.keys(config.env!)).not.toContain('PORT');
     });
 
-    it('lets --env override the two defaults, and only those keys', () => {
-        expect(buildPayloadEnv(flagsFor(['https://x', '--env', 'RUST_LOG=debug', '--env', 'TYPECRATE_PROVIDER_HOST=127.0.0.1']))).toEqual({
+    it('adds a config.port only when the operator names an internal port', () => {
+        expect(buildPayloadConfig(flagsFor([BOX, '--port', '9000']))).toEqual({
+            runCmd: './typecrate-provider-server',
+            port: 9000,
+            artifactPath: 'typecrate-provider-server',
+            probeTimeoutSec: 120,
+            stopSignal: 'SIGTERM',
+            probePath: '/health',
+            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', TYPECRATE_PROVIDER_HOST: '127.0.0.1', RUST_LOG: 'info' },
+        });
+        expect(buildPayloadConfig(flagsFor([BOX, '--port', '0']))).not.toHaveProperty('port');
+    });
+
+    it('honours --probe-path, and keeps loopback readiness by default', () => {
+        expect(buildPayloadConfig(flagsFor([BOX, '--probe-path', '/ready'])).probePath).toBe('/ready');
+        expect(buildPayloadConfig(flagsFor([BOX])).probePath).toBe('/health');
+    });
+
+    it('lets --env override the defaults, and only those keys', () => {
+        expect(buildPayloadEnv(flagsFor([BOX, '--env', 'RUST_LOG=debug', '--env', 'TYPECRATE_PROVIDER_HOST=127.0.0.1']))).toEqual({
             TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json',
-            RUST_LOG: 'debug',
             TYPECRATE_PROVIDER_HOST: '127.0.0.1',
+            RUST_LOG: 'debug',
         });
     });
 
     it('appends the bin flag to runCmd only when --allow-unconfigured is asked for', () => {
-        expect(buildRunCmd(flagsFor(['https://x']))).toBe('./typecrate-provider-server');
-        expect(buildRunCmd(flagsFor(['https://x', '--allow-unconfigured']))).toBe('./typecrate-provider-server --allow-unconfigured');
-    });
-
-    it('reports a config.env PORT that would fight the runner-injected one', () => {
-        expect(portCollisionNotes(flagsFor(['https://x', '--env', 'PORT=9100']))).toEqual(["config.env PORT=9100 overrides the runner's injected PORT=8800: the bin binds 9100 while the container probes 8800 — pass --port 9100 instead of --env PORT=9100"]);
-        expect(portCollisionNotes(flagsFor(['https://x', '--env', 'PORT=8800']))).toEqual([]);
-        expect(portCollisionNotes(flagsFor(['https://x']))).toEqual([]);
+        expect(buildRunCmd(flagsFor([BOX]))).toBe('./typecrate-provider-server');
+        expect(buildRunCmd(flagsFor([BOX, '--allow-unconfigured']))).toBe('./typecrate-provider-server --allow-unconfigured');
     });
 });
 
@@ -407,19 +475,13 @@ describe('buildPayloadEntries', () => {
 });
 
 describe('resolveOutPath', () => {
-    // The fake repo root below is deliberately NOT a real path: the function is pure
-    // string work, and a literal fake keeps the expectation an exact literal too.
     it('anchors a RELATIVE value on the repo root it is given — never on the process cwd', async () => {
-        // The cwd spy is what makes this a regression test rather than a tautology: with
-        // the pre-fix `resolve(value)` this returns '/fake/cwd/Temp/out.tar.gz'.
         await withCwd('/fake/cwd', () => {
             expect(resolveOutPath('Temp/out.tar.gz', '/fake/repo')).toBe('/fake/repo/Temp/out.tar.gz');
         });
     });
 
     it('returns an ABSOLUTE value verbatim — the repo root is never prepended to someone else\'s path', async () => {
-        // CI artifact dirs and `/tmp` stay reachable verbatim; a `.`-prefixed value is a
-        // RELATIVE spelling, so it normalises into the repo root instead.
         await withCwd('/fake/cwd', () => {
             expect(resolveOutPath('/tmp/out.tar.gz', '/fake/repo')).toBe('/tmp/out.tar.gz');
             expect(resolveOutPath('./Temp/out.tar.gz', '/fake/repo')).toBe('/fake/repo/Temp/out.tar.gz');
@@ -427,9 +489,6 @@ describe('resolveOutPath', () => {
     });
 
     it("uses THIS repo root by default, so the verb cannot land scratch inside the package", async () => {
-        // The shipped default, checked from the one cwd that actually breaks in practice:
-        // `yarn workspace @typecrate/provider deploy:endpoint` starts in the PACKAGE
-        // directory, and root AGENTS.md forbids `packages/typecrate/provider/Temp/`.
         await withCwd(PACKAGE_ROOT, () => {
             expect(resolveOutPath('Temp/out.tar.gz')).toBe(join(REPO_ROOT, 'Temp', 'out.tar.gz'));
             expect(resolveOutPath('Temp/out.tar.gz')).not.toBe(join(PACKAGE_ROOT, 'Temp', 'out.tar.gz'));
@@ -440,14 +499,14 @@ describe('resolveOutPath', () => {
 describe('resolveVaultPath', () => {
     it('accepts the artifact a healthy host has', () => {
         const deps: ProviderDeps = { probe: async () => OK({}), fs: healthyFs() };
-        expect(resolveVaultPath(flagsFor(['https://x']), deps)).toBe(VAULT_PATH);
+        expect(resolveVaultPath(flagsFor([BOX]), deps)).toBe(VAULT_PATH);
     });
 
     it('refuses to deploy a payload that cannot authenticate itself, and names the regeneration command', () => {
         const deps: ProviderDeps = { probe: async () => OK({}), fs: fakeFs({ [CARGO_TARGET_BIN]: ELF }) };
         let message = '';
         try {
-            resolveVaultPath(flagsFor(['https://x']), deps);
+            resolveVaultPath(flagsFor([BOX]), deps);
         } catch (failure) {
             message = (failure as Error).message;
         }
@@ -462,13 +521,59 @@ describe('resolveVaultPath', () => {
 
     it('refuses an EMPTY artifact the same way — a 0-byte document is a refused vault, not an empty one', () => {
         const deps: ProviderDeps = { probe: async () => OK({}), fs: fakeFs({ [VAULT_PATH]: '' }) };
-        expect(() => resolveVaultPath(flagsFor(['https://x']), deps)).toThrow(/not a readable non-empty file/);
+        expect(() => resolveVaultPath(flagsFor([BOX]), deps)).toThrow(/not a readable non-empty file/);
     });
 
     it('honours --vault', () => {
         const other = join(REPO_ROOT, 'Temp', 'other-vault.json');
         const deps: ProviderDeps = { probe: async () => OK({}), fs: fakeFs({ [other]: VAULT_DOC }) };
-        expect(resolveVaultPath(flagsFor(['https://x', '--vault', other]), deps)).toBe(other);
+        expect(resolveVaultPath(flagsFor([BOX, '--vault', other]), deps)).toBe(other);
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  THE ADMIN CREDENTIAL — independent of the preview token, never printed
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('resolveAdminToken', () => {
+    it('returns the flag/env value, and nothing at all when no credential is configured', () => {
+        const deps: ProviderDeps = { probe: async () => OK({}), fs: healthyFs() };
+        expect(resolveAdminToken(flagsFor([BOX]), deps)).toBe('');
+        expect(resolveAdminToken(flagsFor([BOX, '--admin-token', 'admin-t0k3n']), deps)).toBe('admin-t0k3n');
+    });
+
+    it('reads the file form, TRIMMED, so a trailing newline is not part of the Bearer', () => {
+        const file = join(REPO_ROOT, 'Temp', 'admin.token');
+        const deps: ProviderDeps = { probe: async () => OK({}), fs: fakeFs({ [file]: 'admin-t0k3n\n' }) };
+        expect(resolveAdminToken(flagsFor([BOX, '--admin-token-file', file]), deps)).toBe('admin-t0k3n');
+    });
+
+    it('refuses a missing or blank file instead of silently deploying without admin auth', () => {
+        const missing = join(REPO_ROOT, 'Temp', 'missing.token');
+        const deps: ProviderDeps = { probe: async () => OK({}), fs: healthyFs() };
+        expect(() => resolveAdminToken(flagsFor([BOX, '--admin-token-file', missing]), deps)).toThrow(/the admin token file is not a readable non-empty file/);
+        expect(() => resolveAdminToken(flagsFor([BOX, '--admin-token-file', missing]), deps)).toThrow(/independent of the preview token/);
+
+        const blank = join(REPO_ROOT, 'Temp', 'blank.token');
+        const blankFs: ProviderDeps = { probe: async () => OK({}), fs: fakeFs({ [blank]: '\n\t\n' }) };
+        expect(() => resolveAdminToken(flagsFor([BOX, '--admin-token-file', blank]), blankFs)).toThrow(/holds no token after trimming/);
+    });
+
+    it('refuses a doubly configured credential at resolution time too, not only in the parser', () => {
+        const deps: ProviderDeps = { probe: async () => OK({}), fs: healthyFs() };
+        expect(() => resolveAdminToken({ adminToken: 'a', adminTokenFile: '/host/a.token' }, deps)).toThrow(/configured twice/);
+    });
+
+    it('anchors the file path ONCE, so the reader and createSandbox cannot disagree', async () => {
+        expect(resolveAdminTokenFile(flagsFor([BOX]))).toBeUndefined();
+        // An absolute value is verbatim; the credential object start:daytona passes to
+        // createSandbox is therefore the same file resolveAdminToken read.
+        expect(resolveAdminTokenFile(flagsFor([BOX, '--admin-token-file', '/host/admin.token']))).toBe('/host/admin.token');
+        // A relative value is anchored on the process cwd HERE, once, instead of being
+        // resolved again by whoever consumes the credential.
+        await withCwd('/fake/cwd', () => {
+            expect(resolveAdminTokenFile(flagsFor([BOX, '--admin-token-file', 'Temp/admin.token']))).toBe('/fake/cwd/Temp/admin.token');
+        });
     });
 });
 
@@ -480,12 +585,10 @@ describe('buildProviderPayload', () => {
     it("runs the client's pinned cargo recipe from the package root, and reads its NDJSON path", async () => {
         const { probe } = scriptedProbe([]);
         const { deps, cargo } = hostDeps(probe);
-        const built = await buildProviderPayload(flagsFor(['https://box.modal.run']), deps);
+        const built = await buildProviderPayload(flagsFor([BOX]), deps);
         expect(cargo.calls).toEqual([
             {
                 command: 'cargo',
-                // The client's own argv: `--bin` is NOT in it (the package target builds
-                // the bin), and --locked is, because Cargo.lock is committed.
                 args: ['build', '--release', '--locked', '-p', 'typecrate-provider', '--message-format=json'],
                 cwd: PACKAGE_ROOT,
             },
@@ -493,19 +596,26 @@ describe('buildProviderPayload', () => {
         expect(built.artifact).toEqual({ path: CARGO_TARGET_BIN, sizeBytes: ELF.length, source: 'cargo-json' });
     });
 
-    it('never spawns cargo on a dry run, and resolves the artifact from the repo-root target-dir instead', async () => {
+    it('never spawns cargo on a dry run, and carries the v2 app identity + targetPrefix', async () => {
         const { probe } = scriptedProbe([]);
         const { deps, cargo } = hostDeps(probe);
-        const built = await buildProviderPayload(flagsFor(['https://box.modal.run', '--dry-run']), deps);
+        const built = await buildProviderPayload(flagsFor([BOX, '--dry-run']), deps);
         expect(cargo.calls).toEqual([]);
         expect(built.artifact).toEqual({ path: CARGO_TARGET_BIN, sizeBytes: ELF.length, source: 'candidate' });
+        // The registry key and the native base path are TOP-LEVEL payload metadata, not
+        // config keys (spec §4.7/§8.5). A `default` name would put the provider on
+        // /app/default/; an empty prefix would route /app/provider/models to /models.
+        expect(built.payload.name).toBe('provider');
+        expect(built.payload.targetPrefix).toBe('/providers/private/v1');
+        expect(built.payload.config).not.toHaveProperty('targetPrefix');
+        expect(built.payload.config).not.toHaveProperty('name');
     });
 
     it('never spawns cargo with --artifact, and ships exactly that file', async () => {
         const explicit = join(REPO_ROOT, '.rust', 'target', 'release', 'elsewhere-server');
         const { probe } = scriptedProbe([]);
         const { deps, cargo } = hostDeps(probe, { fs: fakeFs({ [explicit]: ELF, [VAULT_PATH]: VAULT_DOC }) });
-        const built = await buildProviderPayload(flagsFor(['https://x', '--artifact', explicit]), deps);
+        const built = await buildProviderPayload(flagsFor([BOX, '--artifact', explicit]), deps);
         expect(cargo.calls).toEqual([]);
         expect(built.artifact).toEqual({ path: explicit, sizeBytes: ELF.length, source: 'explicit' });
     });
@@ -513,43 +623,40 @@ describe('buildProviderPayload', () => {
     it('writes exactly the two members, with their modes, inside one gzip — read back with the reader\'s own parser', async () => {
         const { probe } = scriptedProbe([]);
         const { deps } = hostDeps(probe);
-        const built = await buildProviderPayload(flagsFor(['https://x', '--dry-run']), deps);
+        const built = await buildProviderPayload(flagsFor([BOX, '--dry-run']), deps);
         expect(built.payload.filename).toBe('typecrate-provider.tar.gz');
         expect(built.members).toEqual([
             { name: 'typecrate-provider-server', size: ELF.length, mode: 0o755 },
             { name: 'agentic-provider.json', size: VAULT_BYTES, mode: 0o644 },
         ]);
-        // Read back from the bytes, not trusted from the inputs: names, sizes and the exec
-        // bit are what the container sees in its stage dir.
         expect(readTarBundle(built.payload.buffer).map((member) => ({ name: member.name, size: member.size, mode: member.mode }))).toEqual([
             { name: 'typecrate-provider-server', size: ELF.length, mode: 0o755 },
             { name: 'agentic-provider.json', size: VAULT_BYTES, mode: 0o644 },
         ]);
         expect(built.bytes).toBe(built.payload.buffer.length);
-        // The gzip mtime is pinned, so one payload hashes to one digest — a re-deploy is
-        // checkable, and this is the cheapest place to prove it.
-        const again = await buildProviderPayload(flagsFor(['https://x', '--dry-run']), hostDeps(probe).deps);
+        const again = await buildProviderPayload(flagsFor([BOX, '--dry-run']), hostDeps(probe).deps);
         expect(again.payload.buffer.equals(built.payload.buffer)).toBe(true);
     });
 
     it('carries the config alongside the bytes', async () => {
         const { probe } = scriptedProbe([]);
         const { deps } = hostDeps(probe);
-        const built = await buildProviderPayload(flagsFor(['https://x', '--dry-run', '--port', '9000']), deps);
+        const built = await buildProviderPayload(flagsFor([BOX, '--dry-run', '--port', '9000']), deps);
         expect(built.payload.config).toEqual({
             runCmd: './typecrate-provider-server',
             port: 9000,
             artifactPath: 'typecrate-provider-server',
             probeTimeoutSec: 120,
             stopSignal: 'SIGTERM',
-            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', RUST_LOG: 'info' },
+            probePath: '/health',
+            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', TYPECRATE_PROVIDER_HOST: '127.0.0.1', RUST_LOG: 'info' },
         });
     });
 
     it('refuses to assemble when the vault document is missing — before any probe', async () => {
         const { probe, calls } = scriptedProbe([]);
         const { deps, sinks } = hostDeps(probe, { fs: fakeFs({ [CARGO_TARGET_BIN]: ELF, [join(REPO_ROOT, '.cargo', 'config.toml')]: CARGO_CONFIG }) });
-        expect(await main(['https://box.modal.run', '--dry-run'], deps)).toBe(1);
+        expect(await main([BOX, '--dry-run'], deps)).toBe(1);
         expect(sinks.err.join('\n')).toContain(VAULT_REGENERATION_COMMAND);
         expect(calls).toEqual([]);
     });
@@ -557,7 +664,7 @@ describe('buildProviderPayload', () => {
     it('names the build verb when the artifact is not there', async () => {
         const { probe } = scriptedProbe([]);
         const { deps, sinks } = hostDeps(probe, { fs: fakeFs({ [VAULT_PATH]: VAULT_DOC }) });
-        expect(await main(['https://box.modal.run', '--dry-run'], deps)).toBe(1);
+        expect(await main([BOX, '--dry-run'], deps)).toBe(1);
         const printed = sinks.err.join('\n');
         expect(printed).toContain('no release binary "typecrate-provider-server" was found');
         expect(printed).toContain('yarn workspace @typecrate/provider build:server');
@@ -566,24 +673,25 @@ describe('buildProviderPayload', () => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  DEPLOY OPTIONS — the flag mapping, pinned separately because a drift here changes
-//  what the CONTAINER does (a busy slot replaced or refused, wait or not)
+//  what the CONTAINER does (replace or refuse) and what the runner authenticates
 // ══════════════════════════════════════════════════════════════════════════════
 
 describe('buildDeployOptions', () => {
-    it('maps the verbs onto the client options', () => {
-        expect(buildDeployOptions(flagsFor(['https://x', '--token', 't0k3n', '--logs', '200']))).toEqual({
+    it('maps the verbs onto the client options, admin bearer included', () => {
+        expect(buildDeployOptions(flagsFor([BOX, '--token', 't0k3n', '--admin-token', 'at', '--logs', '200']))).toEqual({
             token: 't0k3n',
-            teardownFirst: true,
+            adminToken: 'at',
+            replace: true,
             noWait: false,
             logsLines: 200,
             dryRun: false,
             expectElf: true,
-            // The summary is printed by this module, LAST, after the operator notes.
             printSummary: false,
         });
-        expect(buildDeployOptions(flagsFor(['https://x', '--no-teardown', '--no-wait', '--dry-run']))).toEqual({
+        expect(buildDeployOptions(flagsFor([BOX, '--no-teardown', '--no-wait', '--dry-run']))).toEqual({
             token: '',
-            teardownFirst: false,
+            adminToken: '',
+            replace: false,
             noWait: true,
             logsLines: DEFAULT_LOG_LINES,
             dryRun: true,
@@ -598,56 +706,63 @@ describe('buildDeployOptions', () => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 describe('runDeployEndpoint — dry run', () => {
-    it('touches NOTHING and prints the assembled payload, the config and the summary', async () => {
-        const url = 'https://box.modal.run';
+    it('touches NOTHING and prints the assembled payload, the app identity and the summary', async () => {
         const { probe, calls } = scriptedProbe([]);
         const { deps, sinks, cargo } = hostDeps(probe);
-        // The byte count is measured from the same fake host the verb reads, so the note
-        // is asserted against a real number rather than a guessed one. The warm-up call is
-        // itself a DRY RUN, otherwise it would compile (record a cargo call) and poison the
-        // "a dry run spawns nothing" assertion below.
-        const built = await buildProviderPayload(flagsFor([url, '--dry-run']), deps);
+        const built = await buildProviderPayload(flagsFor([BOX, '--dry-run']), deps);
 
-        expect(await runDeployEndpoint(flagsFor([url, '--dry-run']), deps)).toBe(0);
+        expect(await runDeployEndpoint(flagsFor([BOX, '--dry-run']), deps)).toBe(0);
         expect(calls).toEqual([]);
         expect(cargo.calls).toEqual([]);
 
         const printed = sinks.out.join('\n');
-        expect(printed).toContain('DRY RUN — no probe, no DELETE, no POST, no cargo, no network');
+        expect(printed).toContain('DRY RUN — no probe, no PUT, no DELETE, no POST, no cargo, no network');
+        expect(printed).toContain(`app:       "provider" — clients use https://box.modal.run/app/provider/… ; native prefix /providers/private/v1`);
         expect(printed).toContain(`0755  typecrate-provider-server  ${ELF.length} bytes`);
         expect(printed).toContain(`0644  agentic-provider.json  ${VAULT_BYTES} bytes`);
-        expect(printed).toContain('{"runCmd":"./typecrate-provider-server","port":8800,"artifactPath":"typecrate-provider-server","probeTimeoutSec":120,"stopSignal":"SIGTERM","env":{"TYPECRATE_PROVIDER_VAULT_PATH":"./agentic-provider.json","RUST_LOG":"info"}}');
+        expect(printed).toContain('{"runCmd":"./typecrate-provider-server","artifactPath":"typecrate-provider-server","probeTimeoutSec":120,"stopSignal":"SIGTERM","probePath":"/health","env":{"TYPECRATE_PROVIDER_VAULT_PATH":"./agentic-provider.json","TYPECRATE_PROVIDER_HOST":"127.0.0.1","RUST_LOG":"info"}}');
         expect(printed).toContain(`bundle:    typecrate-provider.tar.gz  (${built.bytes} bytes gzip, 2 members, flat)`);
+        expect(printed).toContain('readiness: HTTP 2xx on /health via LOOPBACK within 120s — client budget 240000 ms');
+        expect(printed).toContain('(direct to the bin: /app/provider/health would map to /providers/private/v1/health and 404, so it is NOT the probe)');
+        expect(printed).toContain('app policy: an existing app is replaced blue-green with PUT /apps/provider — peers untouched');
 
         expect(lastJson(sinks.out)).toEqual({
             mode: 'deploy',
-            endpoint: url,
+            endpoint: BOX,
+            name: 'provider',
             status: 'planned',
-            publicUrl: null,
-            port: 8800,
+            publicUrl: 'https://box.modal.run/app/provider/',
+            reportedPublicUrl: null,
+            path: '/app/provider/',
+            port: 0,
             profile: 'anonymous',
             filename: 'typecrate-provider.tar.gz',
-            notes: plannedNotes(url, built.bytes),
+            notes: plannedNotes(BOX, built.bytes),
         });
+    });
+
+    it('masks BOTH credentials in the plan, and never prints the admin value', async () => {
+        const { probe } = scriptedProbe([]);
+        const { deps, sinks } = hostDeps(probe);
+        expect(await runDeployEndpoint(flagsFor([BOX, '--dry-run', '--token', 's3cret', '--admin-token', 'admin-value-never-printed']), deps)).toBe(0);
+        const printed = sinks.out.join('\n');
+        expect(printed).toContain('auth:      preview *** (length 6) · admin Bearer configured (value never printed)');
+        expect(printed).not.toContain('admin-value-never-printed');
+        // The client's own summary reports the PREVIEW token (documented `token` +
+        // `tokenScope: management`); the ADMIN credential is presence-only there too.
+        expect(lastJson(sinks.out)).toMatchObject({ token: 's3cret', tokenScope: 'management', adminAuth: 'bearer' });
+        expect(JSON.stringify(lastJson(sinks.out))).not.toContain('admin-value-never-printed');
     });
 
     it('still writes the bundle with --out, because a host-side write is not a deploy', async () => {
         const { probe } = scriptedProbe([]);
         const { deps, sinks, written } = hostDeps(probe);
-        // cwd = the PACKAGE directory: the exact place `yarn workspace @typecrate/provider
-        // deploy:endpoint` starts, and the reason a relative `--out` used to drop scratch
-        // into the package tree. The expected path below is the LITERAL repo-root answer,
-        // so a regression to cwd resolution fails here (it would yield
-        // `${PACKAGE_ROOT}/Temp/out.tar.gz`) instead of matching a recomputed resolve().
         await withCwd(PACKAGE_ROOT, async () => {
-            expect(await runDeployEndpoint(flagsFor(['https://box.modal.run', '--dry-run', '--out', 'Temp/out.tar.gz']), deps)).toBe(0);
+            expect(await runDeployEndpoint(flagsFor([BOX, '--dry-run', '--out', 'Temp/out.tar.gz']), deps)).toBe(0);
         });
         expect(written.length).toBe(1);
         expect(written[0]!.path).toBe(join(REPO_ROOT, 'Temp', 'out.tar.gz'));
-        // The path the verb PRINTS is the path it WROTE: one resolution, used twice, so a
-        // note can never promise a file that was not created. (`line()` prefixes PREFIX.)
         expect(sinks.out).toContain(`${PREFIX} bundle written: ${join(REPO_ROOT, 'Temp', 'out.tar.gz')} (${written[0]!.buffer.length} bytes)`);
-        // gzip magic: a bundle the runner extracts flat, not a single staged file.
         expect([...(written[0]!.buffer.subarray(0, 2))]).toEqual([0x1f, 0x8b]);
     });
 
@@ -655,202 +770,272 @@ describe('runDeployEndpoint — dry run', () => {
         const { probe, calls } = scriptedProbe([]);
         const { deps, sinks, written, cargo } = hostDeps(probe);
         const built = await buildProviderPayload(flagsFor(['--out', 'Temp/out.tar.gz', '--dry-run']), deps);
-        // Same cwd trap as the test above, and this path is the one the README runbook
-        // spells (`--out Temp/provider.tar.gz`), so the summary note must name the
-        // repo-root file the write actually created — not a cwd-relative string that would
-        // point a human at a file that does not exist.
         await withCwd(PACKAGE_ROOT, async () => {
             expect(await runDeployEndpoint(flagsFor(['--out', 'Temp/out.tar.gz']), deps)).toBe(0);
         });
         expect(calls).toEqual([]);
-        // A real (non-dry) package-only run DOES compile — that is the client's pinned
-        // recipe — and still never touches the network: no endpoint means nothing to probe.
         expect(cargo.calls.map((call) => `${call.command} ${call.args.join(' ')} (cwd ${call.cwd})`)).toEqual([
             `cargo build --release --locked -p typecrate-provider --message-format=json (cwd ${PACKAGE_ROOT})`,
         ]);
         expect(written.length).toBe(1);
         expect(written[0]!.path).toBe(join(REPO_ROOT, 'Temp', 'out.tar.gz'));
         expect(sinks.out.join('\n')).toContain('no endpoint given — the bundle was the deliverable, nothing was deployed');
-        // The LAST line is one bare JSON summary on EVERY path, package-only included:
-        // `tail -1 | jq` is the machine contract this verb promises.
         expect(lastJson(sinks.out)).toEqual({
             mode: 'deploy',
             endpoint: '',
+            name: 'provider',
             status: 'planned',
             publicUrl: null,
-            port: 8800,
+            reportedPublicUrl: null,
+            path: '/app/provider/',
             profile: 'anonymous',
             filename: 'typecrate-provider.tar.gz',
             notes: [
                 `bundle written to ${join(REPO_ROOT, 'Temp', 'out.tar.gz')} (${built.bytes} bytes, 2 members)`,
-                'no endpoint — POST it later with `deploy:endpoint <url> --no-build`',
+                'no endpoint — POST it later with `deploy:endpoint <url> --no-build` as app "provider" at /app/provider/',
             ],
         });
     });
 
-    it('reports a PORT that would fight the runner-injected one, in the plan and in the summary', async () => {
-        const { probe } = scriptedProbe([]);
+    it('refuses a reserved PORT before any probe or cargo, as a local validation error', async () => {
+        const { probe, calls } = scriptedProbe([]);
         const { deps, sinks } = hostDeps(probe);
-        expect(await runDeployEndpoint(flagsFor(['https://box.modal.run', '--dry-run', '--env', 'PORT=9100']), deps)).toBe(0);
-        const note = "config.env PORT=9100 overrides the runner's injected PORT=8800: the bin binds 9100 while the container probes 8800 — pass --port 9100 instead of --env PORT=9100";
-        expect(sinks.out.join('\n')).toContain(`note:      ${note}`);
+        expect(await main([BOX, '--env', 'PORT=9100'], deps)).toBe(1);
+        expect(calls).toEqual([]);
+        expect(sinks.err[0]).toBe(`${PREFIX} ✗ --env PORT=9100 is RESERVED: the runner injects PORT from the app's internal port and rejects a user value with 400 config_invalid — pass --port <n> (0 or omitted = auto-allocate) instead`);
     });
 });
 
 describe('runDeployEndpoint — a real deploy', () => {
-    it('preflights, ships the ANONYMOUS payload, and waits for the container to say ready', async () => {
-        const url = 'https://box.modal.run';
+    it('handshakes v2, creates the app "provider", and waits on GET /apps/provider', async () => {
         const { probe, calls } = scriptedProbe([
-            ['GET', `${url}/health`, OK(HEALTH)],
-            ['GET', `${url}/status`, OK(STATUS_EMPTY)],
-            ['POST', `${url}/`, ACCEPTED({ slot: 'accepted' })],
-            ['GET', `${url}/status`, OK(STATUS_READY)],
+            ['GET', `${BOX}/health`, OK(HEALTH)],
+            ['GET', `${BOX}/apps/provider`, MISSING()],
+            ['POST', `${BOX}/apps`, ACCEPTED({ ...APP_READY, revision: 1, status: 'pending', ready: false, internalPort: null })],
+            ['GET', `${BOX}/apps/provider`, OK(APP_READY)],
         ]);
         const { deps, sinks, written } = hostDeps(probe);
-        const built = await buildProviderPayload(flagsFor([url]), deps);
-        expect(await runDeployEndpoint(flagsFor([url]), deps)).toBe(0);
+        const built = await buildProviderPayload(flagsFor([BOX]), deps);
+        expect(await runDeployEndpoint(flagsFor([BOX]), deps)).toBe(0);
         expect(written).toEqual([]);
 
-        expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['GET https://box.modal.run/health', 'GET https://box.modal.run/status', 'POST https://box.modal.run/', 'GET https://box.modal.run/status']);
+        expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['GET https://box.modal.run/health', 'GET https://box.modal.run/apps/provider', 'POST https://box.modal.run/apps', 'GET https://box.modal.run/apps/provider']);
 
         const post = calls[2]!;
-        // NO x-runtime-profile anywhere: that absence is the whole anonymity contract.
-        // The config header is compared DECODED, not as a string — the client re-serialises
-        // it through its own defaults (buildConfigHeader), so key ORDER is the client's
-        // business while the decoded object is the provider's contract.
+        // No x-runtime-profile anywhere: that absence is the anonymous contract. The
+        // NAME and TARGET PREFIX are separate v2 headers, and the config header is
+        // compared DECODED because the client re-serialises it.
         const { 'x-runtime-config': header, ...restHeaders } = post.headers;
         expect(restHeaders).toEqual({
             'content-type': 'application/octet-stream',
             'x-runtime-filename': 'typecrate-provider.tar.gz',
+            'x-app-name': 'provider',
+            'x-app-target-prefix': '/providers/private/v1',
         });
-        expect(header).toMatch(/^[A-Za-z0-9_-]+$/);
-        // The header decodes to the exact fixed contract, key for key.
+        expect(header).toBe(encodeConfigHeader(JSON.parse(CANONICAL_CONFIG_JSON) as object));
         expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({
             runCmd: './typecrate-provider-server',
-            port: 8800,
             artifactPath: 'typecrate-provider-server',
             probeTimeoutSec: 120,
             stopSignal: 'SIGTERM',
-            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', RUST_LOG: 'info' },
+            probePath: '/health',
+            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', TYPECRATE_PROVIDER_HOST: '127.0.0.1', RUST_LOG: 'info' },
         });
         expect(post.bodyBytes).toBe(built.bytes);
 
         expect(lastJson(sinks.out)).toEqual({
             mode: 'deploy',
-            endpoint: url,
+            endpoint: BOX,
+            name: 'provider',
             status: 'ready',
-            publicUrl: 'https://box.modal.run',
-            port: 8800,
+            publicUrl: 'https://box.modal.run/app/provider/',
+            reportedPublicUrl: 'https://box.modal.run/app/provider/',
+            path: '/app/provider/',
+            port: 20043,
             profile: 'anonymous',
             filename: 'typecrate-provider.tar.gz',
-            notes: ['format guard: "typecrate-provider-server" is a Linux ELF', 'the endpoint itself serves the payload (it forwards every non-contract path)'],
+            revision: 1,
+            notes: [
+                'format guard: "typecrate-provider-server" is a Linux ELF',
+                'publicUrl: https://box.modal.run/app/provider/ (composed from the runner endpoint and the registry path /app/provider/; the runner also reports https://box.modal.run/app/provider/)',
+            ],
         });
-        // The artifact that shipped is named on stdout by the client's own note, and the
-        // verb names where the credentials went: an operator must be able to see WHAT
-        // shipped without re-reading the flags.
-        expect(sinks.out.join('\n')).toContain(`[runtime-deploy] cargo reported the artifact: ${CARGO_TARGET_BIN}`);
-        expect(sinks.out.join('\n')).toContain('provider (clients): https://box.modal.run');
+        const printed = sinks.out.join('\n');
+        expect(printed).toContain('[runtime-deploy] cargo reported the artifact: ' + CARGO_TARGET_BIN);
+        expect(printed).toContain(`${PREFIX} ✓ ready — app provider revision 1, internal port 20043`);
+        expect(printed).toContain(`${PREFIX}   provider (clients): https://box.modal.run/app/provider/  (mount /app/provider/ → native /providers/private/v1/…)`);
+        // The loopback health route is named as INTERNAL, and the gateway alias is
+        // explicitly denied: /app/provider/health would map to the prefixed 404.
+        expect(printed).toContain(`${PREFIX}   provider health:    the bin's GET /health on the container's LOOPBACK port — NOT exposed as /app/provider/health`);
+        expect(printed).not.toContain('GET https://box.modal.run/app/provider/health');
+        expect(printed).toContain(`${PREFIX}   management:         GET https://box.modal.run/apps · PUT|DELETE https://box.modal.run/apps/provider · GET https://box.modal.run/apps/provider/logs`);
     });
 
-    it('sends the token as the preview header when the endpoint has a secret', async () => {
-        const url = 'https://box.modal.run';
+    it('sends the preview token and the ADMIN bearer together, and keeps them separate', async () => {
         const { probe, calls } = scriptedProbe([
-            ['GET', `${url}/health`, OK(HEALTH)],
-            ['GET', `${url}/status`, OK(STATUS_EMPTY)],
-            ['POST', `${url}/`, ACCEPTED({ slot: 'accepted' })],
-            ['GET', `${url}/status`, OK(STATUS_READY)],
+            ['GET', `${BOX}/health`, OK(HEALTH_ADMIN)],
+            ['GET', `${BOX}/apps/provider`, MISSING()],
+            ['POST', `${BOX}/apps`, ACCEPTED({ ...APP_READY, revision: 1, status: 'pending', ready: false, internalPort: null })],
+            ['GET', `${BOX}/apps/provider`, OK(APP_READY)],
         ]);
         const { deps, sinks } = hostDeps(probe);
-        expect(await runDeployEndpoint(flagsFor([url, '--token', 's3cret']), deps)).toBe(0);
-        for (const call of calls) expect(call.headers['x-daytona-preview-token']).toBe('s3cret');
-        expect(lastJson(sinks.out)).toEqual({
-            mode: 'deploy',
-            endpoint: url,
-            status: 'ready',
-            publicUrl: 'https://box.modal.run',
-            port: 8800,
-            profile: 'anonymous',
-            filename: 'typecrate-provider.tar.gz',
-            notes: ['format guard: "typecrate-provider-server" is a Linux ELF', 'the endpoint itself serves the payload (it forwards every non-contract path)'],
-            token: 's3cret',
-            tokenScope: 'management',
-        });
+        expect(await runDeployEndpoint(flagsFor([BOX, '--token', 's3cret', '--admin-token', 'admin-bearer']), deps)).toBe(0);
+        for (const call of calls) {
+            expect(call.headers['x-daytona-preview-token']).toBe('s3cret');
+            expect(call.headers.authorization).toBe('Bearer admin-bearer');
+        }
+        // Presence only in the summary: the admin VALUE is never echoed.
+        const summary = lastJson(sinks.out);
+        expect(summary).toMatchObject({ status: 'ready', token: 's3cret', tokenScope: 'management', adminAuth: 'bearer' });
+        expect(sinks.out.join('\n')).not.toContain('admin-bearer');
+        expect(sinks.out.join('\n')).toContain('the sandbox requires admin auth (capabilities include admin-auth): mutations carry the admin Bearer when one is configured');
     });
 
-    it('resolves a BUSY slot with DELETE / before shipping (replace-on-arrival)', async () => {
-        const url = 'https://runner.internal';
+    it('replaces an existing app BLUE-GREEN with PUT /apps/provider, and preserves peers', async () => {
+        const replacement = { ...APP_READY, revision: 2, pending: null, internalPort: 20044 };
         const { probe, calls } = scriptedProbe([
-            ['GET', `${url}/health`, OK(HEALTH)],
-            ['GET', `${url}/status`, OK(STATUS_BUSY)], // preflight: someone else holds the slot
-            ['GET', `${url}/status`, OK(STATUS_BUSY)], // teardown names the victim first
-            ['DELETE', `${url}/`, REMOVED()],
-            ['GET', `${url}/status`, OK(STATUS_EMPTY)], // and proves the slot is free
-            ['POST', `${url}/`, ACCEPTED({ slot: 'accepted' })],
-            ['GET', `${url}/status`, OK(STATUS_READY)],
+            ['GET', `${BOX}/health`, OK(HEALTH)],
+            ['GET', `${BOX}/apps/provider`, OK(APP_READY)],
+            ['PUT', `${BOX}/apps/provider`, ACCEPTED({ ...APP_READY, pending: { revision: 2, status: 'booting' } })],
+            ['GET', `${BOX}/apps/provider`, OK(replacement)],
         ]);
         const { deps, sinks } = hostDeps(probe);
-        expect(await runDeployEndpoint(flagsFor([url]), deps)).toBe(0);
+        expect(await runDeployEndpoint(flagsFor([BOX]), deps)).toBe(0);
         expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
-            'GET https://runner.internal/health',
-            'GET https://runner.internal/status',
-            'GET https://runner.internal/status',
-            'DELETE https://runner.internal/',
-            'GET https://runner.internal/status',
-            'POST https://runner.internal/',
-            'GET https://runner.internal/status',
+            'GET https://box.modal.run/health',
+            'GET https://box.modal.run/apps/provider',
+            'PUT https://box.modal.run/apps/provider',
+            'GET https://box.modal.run/apps/provider',
         ]);
-        // What was destroyed is named in the summary, not guessed after the fact.
-        expect(lastJson(sinks.out)).toMatchObject({ replaced: { slot: 'ready', profile: 'generic', port: 8080, runtimeId: 'rt-old' } });
-        expect(sinks.out.join('\n')).toContain('slot: freed a ready runtime');
+        // NEVER a root alias, never DELETE /, never a whole-box reset: the replacement is
+        // one app-scoped PUT and the previous revision kept serving until revision 2.
+        expect(calls.some((call) => call.method === 'DELETE')).toBe(false);
+        expect(calls.some((call) => call.method === 'POST')).toBe(false);
+        expect(lastJson(sinks.out)).toMatchObject({
+            status: 'ready',
+            revision: 2,
+            port: 20044,
+            replaced: { slot: 'ready', profile: 'anonymous', port: 20043, runtimeId: 'app:provider@1' },
+            notes: [
+                'format guard: "typecrate-provider-server" is a Linux ELF',
+                'replace: app=provider revision=1 status=ready port=20043 profile=anonymous filename=typecrate-provider.tar.gz is being replaced blue-green — it keeps serving /app/provider/ until the next revision is ready',
+                'publicUrl: https://box.modal.run/app/provider/ (composed from the runner endpoint and the registry path /app/provider/; the runner also reports https://box.modal.run/app/provider/)',
+            ],
+        });
     });
 
-    it('refuses to touch a busy slot with --no-teardown, and says what to do', async () => {
-        const url = 'https://runner.internal';
+    it('refuses to touch an existing app with --no-teardown, and says what to do', async () => {
         const { probe } = scriptedProbe([
-            ['GET', `${url}/health`, OK(HEALTH)],
-            ['GET', `${url}/status`, OK(STATUS_BUSY)],
+            ['GET', `${BOX}/health`, OK(HEALTH)],
+            ['GET', `${BOX}/apps/provider`, OK(APP_READY)],
         ]);
         const { deps, sinks } = hostDeps(probe);
-        expect(await main([url, '--no-teardown'], deps)).toBe(1);
-        expect(sinks.err.join('\n')).toContain('the slot holds a ready runtime and replacing it is disabled — free it first with teardown');
+        expect(await main([BOX, '--no-teardown'], deps)).toBe(1);
+        expect(sinks.err.join('\n')).toContain('app "provider" already exists (app=provider revision=1 status=ready port=20043 profile=anonymous filename=typecrate-provider.tar.gz) and replacement is disabled — delete it first (DELETE /apps/provider) or allow replacement');
+        expect(lastJson(sinks.out)).toMatchObject({ status: 'busy', name: 'provider', path: '/app/provider/', publicUrl: 'https://box.modal.run/app/provider/' });
     });
 
-    it('reports a failed readiness with the container log tail, and exits 1', async () => {
-        const url = 'https://box.modal.run';
-        const { probe } = scriptedProbe([
-            ['GET', `${url}/health`, OK(HEALTH)],
-            ['GET', `${url}/status`, OK(STATUS_EMPTY)],
-            ['POST', `${url}/`, ACCEPTED({ slot: 'accepted' })],
-            ['GET', `${url}/status`, OK({ slot: 'failed', runtime: { profile: 'generic', port: 8800, ready: false, runtimeId: 'rt-x' } })],
-            ['GET', `${url}/logs?lines=40`, { status: 200, ok: true, json: null, text: 'refused vault artifact: no such file' }],
-        ]);
-        const { deps, sinks } = hostDeps(probe);
-        expect(await runDeployEndpoint(flagsFor([url]), deps)).toBe(1);
-        const printed = sinks.err.join('\n');
-        expect(printed).toContain('✗ failed: the payload reported slot "failed" — its own log tail is attached');
-        expect(printed).toContain('refused vault artifact: no such file');
-        expect(printed).toContain('the slot may still hold this payload: retry with --teardown');
-        expect(lastJson(sinks.out)).toMatchObject({ status: 'failed', publicUrl: null });
-    });
-
-    it('--teardown frees the slot and ships nothing (no cargo, no pack, no POST)', async () => {
-        const url = 'https://box.modal.run';
+    it('reports a failed app with its own log tail from GET /apps/provider/logs, and exits 1', async () => {
         const { probe, calls } = scriptedProbe([
-            ['GET', `${url}/status`, OK(STATUS_BUSY)],
-            ['DELETE', `${url}/`, REMOVED()],
-            ['GET', `${url}/status`, OK(STATUS_EMPTY)],
+            ['GET', `${BOX}/health`, OK(HEALTH)],
+            ['GET', `${BOX}/apps/provider`, MISSING()],
+            ['POST', `${BOX}/apps`, ACCEPTED({ ...APP_FAILED, status: 'pending', ready: false, error: null })],
+            ['GET', `${BOX}/apps/provider`, OK(APP_FAILED)],
+            ['GET', `${BOX}/apps/provider/logs?lines=40`, { status: 200, ok: true, json: null, text: 'booting ./typecrate-provider-server\nerror: vault document refused' }],
+        ]);
+        const { deps, sinks } = hostDeps(probe);
+        expect(await runDeployEndpoint(flagsFor([BOX]), deps)).toBe(1);
+        expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+            'GET https://box.modal.run/health',
+            'GET https://box.modal.run/apps/provider',
+            'POST https://box.modal.run/apps',
+            'GET https://box.modal.run/apps/provider',
+            'GET https://box.modal.run/apps/provider/logs?lines=40',
+        ]);
+        const printed = sinks.err.join('\n');
+        expect(printed).toContain('✗ failed: the app reported status "failed" (vault document refused) — its own log tail is attached');
+        expect(printed).toContain('── GET /apps/provider/logs (2 lines) ──');
+        expect(printed).toContain('booting ./typecrate-provider-server');
+        expect(printed).toContain('the app "provider" may still be registered as failed: rerun this verb to replace it blue-green');
+        expect(lastJson(sinks.out)).toMatchObject({
+            status: 'failed',
+            name: 'provider',
+            publicUrl: 'https://box.modal.run/app/provider/',
+            path: '/app/provider/',
+            notes: [
+                'format guard: "typecrate-provider-server" is a Linux ELF',
+                'the app reported status "failed" (vault document refused) — its own log tail is attached',
+                'log tail attached (2 lines)',
+            ],
+        });
+    });
+
+    it('re-reads the shared log route when the client could not attach a tail, so the reason is visible', async () => {
+        const { probe, calls } = scriptedProbe([
+            ['GET', `${BOX}/health`, OK(HEALTH)],
+            ['GET', `${BOX}/apps/provider`, MISSING()],
+            ['POST', `${BOX}/apps`, ACCEPTED({ ...APP_FAILED, status: 'pending', ready: false, error: null })],
+            ['GET', `${BOX}/apps/provider`, OK(APP_FAILED)],
+            // The client's own best-effort tail MISSES (a 503), and the verb retries once.
+            ['GET', `${BOX}/apps/provider/logs?lines=120`, { status: 503, ok: false, json: null, text: 'proxy warming up' }],
+            ['GET', `${BOX}/apps/provider/logs?lines=120`, { status: 503, ok: false, json: null, text: 'proxy warming up' }],
+        ]);
+        const { deps, sinks } = hostDeps(probe);
+        expect(await runDeployEndpoint(flagsFor([BOX, '--logs', '120']), deps)).toBe(1);
+        expect(calls.length).toBe(6);
+        expect(sinks.err.join('\n')).toContain(`${PREFIX} no app log tail: GET /apps/provider/logs → HTTP 503: proxy warming up`);
+    });
+
+    it('--teardown unregisters ONLY the app and ships nothing (no cargo, no pack, no POST)', async () => {
+        const { probe, calls } = scriptedProbe([
+            ['GET', `${BOX}/health`, OK(HEALTH)],
+            ['GET', `${BOX}/apps/provider`, OK(APP_READY)],
+            ['DELETE', `${BOX}/apps/provider`, OK({ tornDown: true, name: 'provider', removed: true })],
+            ['GET', `${BOX}/apps/provider`, MISSING()],
         ]);
         const { deps, sinks, cargo } = hostDeps(probe);
-        expect(await runDeployEndpoint(flagsFor([url, '--teardown']), deps)).toBe(0);
-        expect(calls.map((call) => call.method)).toEqual(['GET', 'DELETE', 'GET']);
+        expect(await runDeployEndpoint(flagsFor([BOX, '--teardown', '--admin-token', 'admin-bearer']), deps)).toBe(0);
+        expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+            'GET https://box.modal.run/health',
+            'GET https://box.modal.run/apps/provider',
+            'DELETE https://box.modal.run/apps/provider',
+            'GET https://box.modal.run/apps/provider',
+        ]);
+        expect(calls[2]!.headers.authorization).toBe('Bearer admin-bearer');
         expect(cargo.calls).toEqual([]);
         expect(lastJson(sinks.out)).toEqual({
             mode: 'teardown',
-            endpoint: url,
+            endpoint: BOX,
+            name: 'provider',
             status: 'ready',
             publicUrl: null,
-            notes: ['slot now reads "empty" — the container keeps serving and is ready for the next POST'],
-            replaced: { slot: 'ready', profile: 'generic', port: 8080, runtimeId: 'rt-old' },
+            reportedPublicUrl: null,
+            path: null,
+            notes: ['DELETE /apps/provider — the runner keeps serving every other app'],
+            adminAuth: 'bearer',
+            replaced: { slot: 'ready', profile: 'anonymous', port: 20043, runtimeId: 'app:provider@1' },
+            removed: true,
+        });
+    });
+
+    it('--teardown of an UNREGISTERED app is idempotent success (removed:false)', async () => {
+        const { probe, calls } = scriptedProbe([
+            ['GET', `${BOX}/health`, OK(HEALTH)],
+            ['GET', `${BOX}/apps/provider`, MISSING()],
+        ]);
+        const { deps, sinks } = hostDeps(probe);
+        expect(await runDeployEndpoint(flagsFor([BOX, '--teardown']), deps)).toBe(0);
+        expect(calls.map((call) => call.method)).toEqual(['GET', 'GET']);
+        expect(JSON.parse(sinks.out[sinks.out.length - 1]!)).toEqual({
+            mode: 'teardown',
+            endpoint: BOX,
+            name: 'provider',
+            status: 'ready',
+            publicUrl: null,
+            reportedPublicUrl: null,
+            path: null,
+            notes: ['DELETE /apps/provider — the runner keeps serving every other app'],
+            removed: false,
         });
     });
 });
@@ -861,8 +1046,6 @@ describe('main', () => {
         const { deps, sinks } = hostDeps(probe);
         expect(await main(['--help'], deps)).toBe(0);
         expect(calls).toEqual([]);
-        // One line, verbatim, unprefixed: the usage screen is the contract, and a prefix
-        // on it would break `… --help | head -1`.
         expect(sinks.out).toEqual([USAGE]);
     });
 
@@ -870,8 +1053,6 @@ describe('main', () => {
         const { probe } = scriptedProbe([]);
         const { deps, sinks } = hostDeps(probe);
         expect(await main(['--nope'], deps)).toBe(1);
-        // TWO problems from one token: the unknown flag, and the endpoint it left unset.
-        // A blank line separates the errors from the usage screen.
         expect(sinks.err).toEqual([`${PREFIX} ✗ unknown flag "--nope"`, `${PREFIX} ✗ no endpoint — pass the runner URL as the argument, or --endpoint <url>, or ${ENDPOINT_ENV}=… (or use --out <path> to only build the bundle)`, '', USAGE]);
     });
 
@@ -886,9 +1067,26 @@ describe('main', () => {
             stat: () => ({ size: 1, isFile: true }),
         };
         const { deps, sinks } = hostDeps(probe, { fs: broken });
-        expect(await main(['https://box.modal.run', '--dry-run'], deps)).toBe(1);
+        expect(await main([BOX, '--dry-run'], deps)).toBe(1);
         expect(sinks.err[0]).toContain('✗ unexpected failure:');
         expect(sinks.err[0]).toContain('disk on fire');
+    });
+
+    it('documents the v2 surface: the app name, targetPrefix, auto port and the denied health alias', () => {
+        expect(USAGE).toContain('registers it as the app "provider"');
+        expect(USAGE).toContain('targetPrefix "/providers/private/v1"');
+        expect(USAGE).toContain('/app/provider/models maps to the bin\'s native /providers/private/v1/models');
+        expect(USAGE).toContain('--port <n>            OPTIONAL internal loopback port');
+        expect(USAGE).toContain('--admin-token <t>');
+        expect(USAGE).toContain('--admin-token-file <path>');
+        expect(USAGE).toContain('PUT /apps/provider');
+        expect(USAGE).toContain('DELETE /apps/provider only');
+        // Health is loopback-only: the usage must say so, not advertise the mount alias.
+        expect(USAGE).toContain('never');
+        expect(USAGE).toContain('/app/provider/health, which would map to /providers/private/v1/health and 404');
+        expect(USAGE).not.toContain('runtime contract v1');
+        expect(USAGE).not.toContain('DELETE / only');
+        expect(USAGE).not.toContain('GET /status');
     });
 });
 
@@ -902,17 +1100,10 @@ describe('isCliEntryPoint', () => {
     const wrapper = '/repo/packages/typecrate/provider/scripts/start-modal.ts';
 
     it('fires for argv naming the script, and for the lifecycle line', () => {
-        // Rule 1, absolute: vite-node keeps the file on the command line.
         expect(isCliEntryPoint({ modulePath: verb, argv: ['node', verb] })).toBe(true);
-        // Rule 1, relative: the token must be a PATH SUFFIX of the module, so a sibling
-        // package's script of the same name in the wrong directory cannot fire it.
         expect(isCliEntryPoint({ modulePath: verb, argv: ['node', 'vite-node', '--script', 'scripts/deploy-endpoint.ts'] })).toBe(true);
-        // Rule 2: the yarn lifecycle line.
         expect(isCliEntryPoint({ modulePath: verb, env: { npm_lifecycle_script: 'vite-node scripts/deploy-endpoint.ts' } })).toBe(true);
-        // …and it is per-script: the wrapper's lifecycle line must not fire the verb.
         expect(isCliEntryPoint({ modulePath: verb, env: { npm_lifecycle_script: 'vite-node scripts/start-modal.ts' } })).toBe(false);
-        // A test importing the verb names `deploy-endpoint.test.ts`, which is NOT a suffix
-        // of `deploy-endpoint.ts` — the near-miss the old name-based regex used to swallow.
         expect(isCliEntryPoint({ modulePath: verb, argv: ['node', '/repo/packages/typecrate/provider/scripts/deploy-endpoint.test.ts'] })).toBe(false);
     });
 
@@ -921,12 +1112,8 @@ describe('isCliEntryPoint', () => {
     });
 
     it('fires only when NOTHING but the runner sits above the module', () => {
-        // Rule 3: `vite-node scripts/deploy-endpoint.ts` rewrites argv and drops the file,
-        // so the module-runner stack is the only evidence left.
         expect(isCliEntryPoint({ modulePath: verb, stack: `Error\n    at Object.<anonymous> (${verb}:1:1)\n    at ViteNodeRunner.executeFile (runner.mjs:1:1)` })).toBe(true);
-        // start-modal.ts importing the verb is exactly the case that must NOT auto-run.
         expect(isCliEntryPoint({ modulePath: verb, stack: `Error\n    at Object.<anonymous> (${verb}:1:1)\n    at mainModal (${wrapper}:3:3)\n    at ViteNodeRunner.executeFile (runner.mjs:1:1)` })).toBe(false);
-        // …while the wrapper's own guard does fire for the wrapper.
         expect(isCliEntryPoint({ modulePath: wrapper, stack: `Error\n    at Object.<anonymous> (${wrapper}:1:1)\n    at ViteNodeRunner.executeFile (runner.mjs:1:1)` })).toBe(true);
         expect(isCliEntryPoint({ modulePath: '/repo/packages/typecrate/provider/scripts/start-daytona.ts', env: { npm_lifecycle_script: 'vite-node scripts/start-daytona.ts' } })).toBe(true);
     });

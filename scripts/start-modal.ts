@@ -13,11 +13,13 @@
 //  as fixed configuration and reads it from the vault with no override
 //  (`packages/typecrate/nexus/scripts/start-modal.ts:25-26`: `main([Object.values(modalContainer)[0],
 //  ...argv])` — the vault value always wins, and a positional URL has to AGREE with it).
-//  That works for one workload on one box. It does not work here, because THE BOX THIS
-//  REPO DEPLOYS TO IS ALREADY OCCUPIED by another workload: the runner inside it holds one
-//  payload slot, and a second workload deployed into the same box either displaces the
-//  first (the client's default replaces a busy slot) or fails (--no-teardown). So the
-//  provider endpoint is a first-class parameter, in this order:
+//  That works for one workload on one box, but the box this repo owns is SHARED: under
+//  runtime v2 it is a multi-app registry, so deploying the provider as the app "provider"
+//  coexists with whatever else the box serves (/app/nexus/, /app/dashboard/, …) and no
+//  peer is displaced. The URL is still a first-class parameter, because WHICH box a
+//  workload lands on is an operator decision (resources, admin auth, blast radius), not
+//  package identity — a blanket default would put the provider on someone else's origin
+//  with no chance to say no. The precedence is, in this order:
 //
 //      1. --endpoint <url>            (or the bare positional URL)   — explicit per run
 //      2. TYPECRATE_PROVIDER_ENDPOINT                                 — CI / a second box,
@@ -26,14 +28,16 @@
 //
 //  A SECOND BOX gets its own URL, and it is DERIVED, not typed out of a hat: Modal names
 //  a deployment `https://<source>--<BOX_LABEL>.modal.run` (the file that defines the box
-//  says so at services/modal/deploy/sandbox/modal-sandbox-container.py:4540-4544 `BOX_LABEL`, and the
-//  whole "A SECOND BOX" header block there at :179-213 lists the env names that move it).
-//  Choosing runtime port 8800 breaks nothing on a box — a box has ONE forwarded port for the
-//  ready runtime, and the payload's declared port only feeds the reported `preview.url`
-//  bookkeeping (see the README runbook "Getting a dedicated box").
+//  says so in the `BOX_LABEL` comment at services/modal/deploy/sandbox/modal-sandbox-container.py
+//  `:343-345`, and the `DRIVER CONFIGURATION` block at `:164-191` lists the four env names that
+//  move it — search `SANDBOX_BOX_LABEL` rather than trusting a line number, that file is edited
+//  concurrently).
+//  The provider's internal port is the runner's choice now (v2 auto-allocates unless
+//  --port names one), and it is never public: clients always use `/app/provider/…` on the
+//  box's ONE origin (see the README runbook "Getting a dedicated box").
 //
 //  Everything except the URL is the generic verb: scripts/deploy-endpoint.ts, with every
-//  flag forwarded verbatim. Nothing here re-implements cargo, packaging, the slot policy
+//  flag forwarded verbatim. Nothing here re-implements cargo, packaging, the app policy
 //  or the readiness poll — those live in @services/daytona/sandbox (runtime-deploy.ts),
 //  which is the client BOTH this package and nexus share.
 //
@@ -106,7 +110,7 @@ const describeSource = (source: EndpointSource, endpoint: string, label: string)
             ? 'the command line (--endpoint / the positional URL)'
             : source === 'environment'
               ? `$${ENDPOINT_ENV}`
-              : `@config/vault modalContainer${label ? `.${label}` : ''} — override it with --endpoint or ${ENDPOINT_ENV} when this box is not yours to replace`
+              : `@config/vault modalContainer${label ? `.${label}` : ''} — override it with --endpoint or ${ENDPOINT_ENV} to place the provider app on a different origin`
     }`;
 
 /**

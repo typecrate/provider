@@ -386,12 +386,14 @@ quietly re-litigate.
   two hosts are alternatives, never stacked.
 - **The credential gate is FAIL-FAST here and SOFT in the library, deliberately.** The library answers
   503 while the vault is missing (`src/serve.rs`, "the deviation the wire cannot avoid") because it is
-  compiled into a process that also serves `/v1/harness`. A container runner probes by **TCP connect**,
-  so that soft listener would pass readiness while serving nothing but 503s and a bad credential would
-  become a silently-degraded deployment; the bin therefore runs the gate **before the bind** and exits 1
-  with the regeneration command (`src/bin/server.rs:29-42`). `--allow-unconfigured` restores the lazy
-  503 for the cases where booting empty is what the operator asked for. This is the single behaviour the
-  bin *adds* to the contract, and it is why a deploy needs no health endpoint.
+  compiled into a process that also serves `/v1/harness`. A container runner probes the app's
+  `probePath` (the deploy sends `/health`; spec §8.7), so a soft listener would pass readiness while
+  serving nothing but 503s and a bad credential would become a silently-degraded deployment; the bin
+  therefore runs the gate **before the bind** and exits 1 with the regeneration command
+  (`src/bin/server.rs:29-42`). `--allow-unconfigured` restores the lazy 503 for the cases where booting
+  empty is what the operator asked for. This is the single behaviour the bin *adds* to the contract, and
+  it is why a deploy does not need a provider-authored gateway route: the bin's own root `/health` is
+  the probe target, and it is deliberately NOT part of the `/providers/private/v1` native surface.
 - **Exit codes 0 / 1 / 2, and a hand-built tokio runtime.** The sibling convention
   (`packages/typecrate/services/src/bin/server.rs:251-254`): a supervisor restarts 2 and fixes 1. `main`
   builds the runtime by hand and calls `std::process::exit` because
@@ -405,8 +407,9 @@ quietly re-litigate.
   routes, and a fifth path constant in the library would change what `packages/typecrate/services`
   **lists** for this package. Consequence an operator has to know: on a Modal box the runner's own routes
   shadow the service's at `/`, `/health`, `/tools`, `/stats`, `/status`, `/logs`
-  (`services/modal/deploy/sandbox/modal-sandbox-container.py:300`), so that path is not a reliable probe
-  of *this* payload through a box.
+  (the adapter's `THE ENDPOINT IS ONE ORIGIN` block, `modal-sandbox-container.py:10-17`: the box
+  reverse-proxies ONE port and the runner owns every path), so that path is not a reliable probe of
+  *this* payload through a box.
 - **The `tracing` subscriber is hand-written** over `tracing` + `tracing-core`
   (`src/bin/server.rs:64-76`), because `tracing-subscriber` is in no typecrate lockfile and adding it
   would break `tests/transport.rs::the_lock_package_set_is_a_strict_subset_of_the_siblings` — the same
@@ -423,27 +426,43 @@ quietly re-litigate.
 
 - **No `x-runtime-profile` header at all**, i.e. the container's `generic` profile
   (`services/daytona/sandbox/runtime-server/src/contract.rs`): the allowed config keys are exactly
-  `runCmd, port, probePath, probeTimeoutSec, stopSignal, buildCmd, buildTimeoutSec, artifactPath, env`,
-  the defaults are `port 8080` / `SIGTERM` / `60 s`, and the profile adds no key, no signature and no
-  registry lookup. A tar.gz **must** name `runCmd`, because an archive can hold anything and the runner
-  refuses to exec blind (`contract.rs`; the client validates it too).
-- **`probePath` is omitted, and that absence is the payload's readiness contract** — no `probePath`
-  means a bare TCP connect (`contract.rs`), the only rule that assumes nothing about what is
-  running. `--probe-path /health` is offered because the bin really does serve it, but on a box it would
-  be answered by the **runner** (the shadowing bullet above), so the default is the honest one.
-- **Credentials are a bundle member, never a `config.env` value.** `GET /status` echoes the posted
-  config **verbatim** to a caller that presented no secret (`contract.rs`), and the box has no
-  authentication layer of its own (`modal-sandbox-container.py:301-306`: "anyone holding the URL can
-  POST code"). So the anonymity is bidirectional — the container does not know what it runs, and it does
-  not authenticate the caller — and the payload's authentication is therefore its own business: the
-  vault document rides inside the tar.gz and `env` carries only `TYPECRATE_PROVIDER_VAULT_PATH` as a
-  **relative** path (`./agentic-provider.json`, resolved against the runner's stage dir, which is the
-  child's cwd — `src/bin/server.rs:156-158`).
-- **`port: 8800` is a contract, not a preference.** The runner forces `PORT` to the declared
-  `config.port` in the child environment (`services/daytona/sandbox/runtime-server`
-  `childEnv`, `modal-sandbox-container.py:1895-1899` `_child_env`) and `config.env` outranks that
-  injection, so `--env PORT=9100` with `--port 8800` boots a server the probe is not watching — hence
-  `portCollisionNotes` (`scripts/deploy-endpoint.ts:446-450`) rather than a silent footgun.
+  `runCmd, port, probePath, probeTimeoutSec, stopSignal, stopGraceSec, buildCmd, buildTimeoutSec,
+  artifactPath, env`, the defaults are `SIGTERM` / `60 s` / an auto-allocated port, and the profile adds
+  no key, no signature and no registry lookup. A tar.gz **must** name `runCmd`, because an archive can
+  hold anything and the runner refuses to exec blind (`contract.rs`; the client validates it too).
+- **The app name and native prefix are TOP-LEVEL metadata, not config.** `RuntimePayload.name` is the
+  registry key and `targetPrefix` the native base path (spec §4.7/§8.5); the deploy passes
+  `name: 'provider'` EXPLICITLY (omitting it registers `default` at `/app/default/`) and
+  `targetPrefix: '/providers/private/v1'`, which is why `/app/provider/models` reaches the crate's own
+  `/providers/private/v1/models`. They travel as `x-app-name` / `x-app-target-prefix` for a binary
+  upload; neither is a `config` key.
+- **Readiness is the bin's own `/health`, probed DIRECTLY on loopback.** The v2 runner probes
+  `http://127.0.0.1:<internal port><probePath>` (spec §8.7), so `probePath: '/health'` reaches the
+  provider process itself. It must NOT be routed: `/app/provider/health` would become
+  `/providers/private/v1/health`, a path the crate does not serve — the usage text and the run summary
+  explicitly deny that alias instead of advertising it. (`--probe-path` still allows another loopback
+  route.)
+- **Credentials are a bundle member, never a `config.env` value.** v2's `AppView` exposes only
+  `envKeys` and redacts env VALUES (spec R-5.1/R-5.2) while the full config is persisted in `app.json`,
+  and the control plane is only as protected as the runner's admin auth
+  (`modal-sandbox-container.py:48-62` `ADMIN AUTH`, and `_print_recipe`'s auth note at `:2097-2109`:
+  with no `SANDBOX_ADMIN_TOKEN` set, "anyone with this URL can deploy"). A sandbox gets the token as a
+  Modal Secret (collapsed with the runner config on a client without `env`), and every `/health` gate
+  requires `authRequired == (an admin token is configured here)`. So a credential in
+  `config.env` is enumerable metadata (the key alone names it) and is never the right carrier. The
+  anonymity is bidirectional — the container does not know what it runs, and it does not authenticate
+  the caller — and the payload's authentication is therefore its own business: the vault document rides
+  inside the tar.gz and `env` carries only `TYPECRATE_PROVIDER_VAULT_PATH` as a **relative** path
+  (`./agentic-provider.json`, resolved against the runner's stage dir, which is the child's cwd —
+  `src/bin/server.rs:156-158`).
+- **`config.port` is OMITTED by default; `PORT` is RESERVED.** v2 auto-allocates the internal port and
+  injects it as `PORT` (spec §8.3), which the bin honours; `--port <n>` pins one and `--port 0` is the
+  explicit spelling of auto. A user `PORT` is a hard `400 config_invalid` (R-8.3/R-8.4 — the v1
+  decoupled bind/probe warning is gone), so `reservedEnvErrors` in `scripts/deploy-endpoint.ts` refuses
+  `--env PORT=…` at parse time with the fix (`--port`). `config.env` also carries
+  `TYPECRATE_PROVIDER_HOST=127.0.0.1` (R-8.5): the gateway is the only way in, and no other interface
+  exposes the provider. The internal port in any summary is the registry's loopback port, never a
+  public one.
 - **`stopSignal: SIGTERM` is safe because the bin drains.** SIGTERM/SIGINT/Ctrl+C stop it after
   in-flight requests finish, with exit 0 (`src/bin/server.rs:186-188`); an anonymous payload's default
   stop signal is SIGTERM precisely because a stranger cannot be assumed to have nexus's worker-pool
@@ -451,35 +470,42 @@ quietly re-litigate.
 - **The endpoint is an argument, never a package constant.** `start:modal` resolves
   `--endpoint`/positional > `TYPECRATE_PROVIDER_ENDPOINT` > `@config/vault` `modalContainer`, while
   nexus's `start-modal.ts:25-26` pins the vault value with no override. The reason is concrete: the box
-  this repo owns (`config/vault/src/container/modal-container.ts:1-3`) is occupied by another workload
-  and one runner holds one payload slot, so a deploy here either displaces that workload or fails — and a
-  second box has its own `https://<source>--<BOX_LABEL>.modal.run`
-  (`modal-sandbox-container.py:4540-4544` `BOX_LABEL`). The wrapper prints which source won, for the same reason.
+  this repo owns (`config/vault/src/container/modal-container.ts:1-3`) already serves another workload.
+  Under v2 that is no longer a conflict — the registry is multi-app, so the provider registers as
+  `provider` beside the peers and a blue-green PUT replaces only that app — but WHICH box receives it is
+  still an operator decision (resources, admin auth, blast radius), and a second box has its own
+  `https://<source>--<BOX_LABEL>.modal.run` (`modal-sandbox-container.py:343-345`, the `BOX_LABEL`
+  assignment with the comment that says why it is env-overridable). The
+  wrapper prints which source won, for the same reason. Peers are preserved because the verb never
+  touches `/`, a `default` alias, or `DELETE /_provider/sandbox`.
 - **Every side effect is injected, and importing a verb starts nothing.** The verbs are pure functions
-  over `ProviderDeps`/`DaytonaDeps` (`scripts/deploy-endpoint.ts:482-486`,
-  `scripts/start-daytona.ts:216-221`), mirroring the client's own `RuntimeDeps` discipline, so
-  `vitest` drives all three with no network, no cargo and no Daytona call (86 tests). The entry detector
+  over `ProviderDeps` (`scripts/deploy-endpoint.ts`) and `DaytonaDeps`
+  (`scripts/start-daytona.ts`), mirroring the client's own `RuntimeDeps` discipline, so
+  `vitest` drives all three with no network, no cargo and no Daytona call (101 tests). The entry detector
   lives in `scripts/entry-guard.ts` because **three** files are entry points and two of them import the
   third: nexus's equivalent has no guard, so importing `nexus/scripts/start-modal.ts` performs a deploy
   (`start-modal.ts:25-26`) — a shape that would make this package's own test suite deploy twice.
-- **A dry run also skips cargo.** The client's dry-run posture sends nothing
-  (`services/daytona/sandbox/runtime-deploy.ts:1777-1787`); this verb additionally passes
-  `noBuild: flags.noBuild || flags.dryRun` (`scripts/deploy-endpoint.ts:549-563`) so the flag works on a
-  host with no registry access at all — the artifact must already exist, which is what makes the offline
-  claim checkable rather than aspirational.
-- **Daytona needs its own verb because of a two-port rule.** `createSandbox({ port })` mints the
-  preview link of the **runner's** port (`services/daytona/sandbox/setup-sandbox.ts:234`, `:1447`), which
-  is the management endpoint; the **provider's** URL is a second link, minted after the deploy with
-  `getPreviewLink(<payload port>)`, and its token is not derivable from anything the runner says
-  (`runtime-deploy.ts:1580-1591` reports `publicUrl: null` on Daytona by construction). Lifecycle is the
-  caller's: never delete on success, delete on a failed deploy unless `--keep-on-fail`, and
-  `createSandbox` already deletes its own half-built machine
-  (`setup-sandbox.ts:1553-1563`).
+- **A dry run also skips cargo.** The client's dry-run posture sends nothing (`deployPayload`'s
+  `options.dryRun` branch); this verb additionally passes
+  `noBuild: flags.noBuild || flags.dryRun` in `buildProviderPayload` (`scripts/deploy-endpoint.ts`) so
+  the flag works on a host with no registry access at all — the artifact must already exist, which is
+  what makes the offline claim checkable rather than aspirational.
+- **Daytona needs its own verb because it CREATES the machine, not because of a two-port rule.**
+  `createSandbox({ port })` mints the preview link of the **runner's** port
+  (`services/daytona/sandbox/setup-sandbox.ts`, `RUNNER_PORT`), which is the management endpoint, and
+  `port` is deliberately left unset there. v2 has ONE origin and serves every app under `/app/<name>/`,
+  so the **provider's** base is that same endpoint + `result.path` (`/app/provider/`) — there is no
+  `getPreviewLink(<payload port>)` call, no per-port token and no port to publish. The compatibility
+  field `providerToken` in the summary is the SAME preview token reported on `endpoint`, because one
+  origin means one credential. Lifecycle is the caller's: never delete on success, delete on a failed
+  deploy unless `--keep-on-fail`, and `createSandbox` already deletes its own half-built machine. The
+  admin bearer (spec §12.3) flows into `createSandbox` in its preferred FILE form and rides on the
+  deploy/log/delete calls; it is never printed.
 - **One machine-readable last line, on every path.** Human output is prefixed `[provider:deploy]`; the
-  final line is a bare JSON object (`buildSummary`, `runtime-deploy.ts:1600-1631`), so `tail -1 | jq`
+  final line is a bare JSON object (`buildSummary`), so `tail -1 | jq`
   works for a deploy, a teardown, a dry run and a Daytona create alike. `start:daytona` prints its **own**
-  summary last because the client's shape has no room for `sandboxId` or the minted link, and its
-  `publicUrl` is null by construction.
+  summary last because the client's shape has no room for `sandboxId`; its `port` is the INTERNAL
+  registry port and is omitted when not assigned yet.
 - **The npm layer is cargo-only no longer, and the docs had to move with it.** `package.json` gained
   `dependencies` (`@config/vault`, `@services/daytona`) and the `#layout` / `#rust` notes that used to
   say "owns no listener of its own" and "no verb needs a vite-node pre-step" now say which half of that
@@ -573,10 +599,10 @@ ran (`tests/routes.rs:5-8`), against a real in-process listener rather than a mo
 fail-fast gate, the `/health` body, the `ANY` refusals and the preflight `204` are wire facts, not
 assertions about a hand-built `Next`. Still not covered, and stated so nobody over-reads the 175: no live
 upstream, no run inside the `typecrate-services` binary (the route-file half is still pinned by literals
-and by services' own tests), no `POST /` to a live Modal box or Daytona sandbox, no Daytona or Lightning
-**rows** (they are absent, not exercised), no HTML dashboard, no stats persistence, and not all 29 rows
-exercised individually. The npm verbs are covered separately, by
-`yarn vitest run packages/typecrate/provider/scripts` — 86 tests with every side effect injected, so
+and by services' own tests), no `POST /apps` / `PUT /apps/provider` to a live v2 Modal box or Daytona
+sandbox, no Daytona or Lightning **rows** (they are absent, not exercised), no HTML dashboard, no stats
+persistence, and not all 29 rows exercised individually. The npm verbs are covered separately, by
+`yarn vitest run packages/typecrate/provider/scripts` — 101 tests with every side effect injected, so
 they need neither network nor cargo.
 
 Two pre-existing TypeScript failures are recorded so nobody files them as port regressions:
@@ -610,9 +636,10 @@ TypeScript-side camelCase members verified separately, or numbers that are not l
 | 8 | a cite worth keeping: `serve.rs` and `provider-route.rs` cite `start.ts:780` for "one listener per distinct declared port" | `start.ts:777-781` is exactly the port-grouping phase | unchanged — re-verified, no edit |
 | 9 | the `RoutingVendor` doc listed eight `merge/merge-*.ts` call sites and then said "the **seven** names are the complete set" | eight call sites, **five** distinct vendors (`telnyx`, `pareto`, `modal`, `deepinfra`, `openai`) — which is why the enum has five variants | `src/lib.rs:17` ("eight `vendor:` injections (five distinct values)") and the `RoutingVendor` doc in `src/client.rs` |
 | 10 | `error.rs` cited `start.ts:319-327` for `STREAM_ERROR_CODES` | the doc comment is `:317`, the `as const` array `:318-326` (the six codes `:319-325`), and `:327` is the `StreamErrorCode` alias | `src/error.rs:6` and `:83` |
-| 12 | drift this pass found in its **own** documents and scripts, after the `[[bin]]` and the deploy verbs landed: `package.json` `#layout` "owns no listener of its own", `#rust` "no vite-node pre-step", `README.md`/`knowledge.md` still describing a crate with no process of its own (a "no `[[bin]]`" / "served only by the services router" shape) and stale test totals (**137** and **148**), `.github/workflows/ci.yml:11-14` "the crate has no npm dependencies", and three drifted cites in `scripts/` | the crate owns a listener and has two hosts (bin / route file); the cargo verbs need no pre-step but the three deploy verbs are `vite-node`; the totals are **175** (173 + 2 doctests, per the run recorded under README "Verification"); the crate still has no npm dependencies, but **the package now does** (`@config/vault`, `@services/daytona`, for the scripts only); `contract.rs` is really the `probePath` bullet of the `generic` profile's defaults doc (`contract.rs` as this row is re-pointed today — the TCP-readiness rule, not a function); `modal-sandbox-container.py:1835` is really `:1895-1899`, the child-env builder — named `_runtime_env` when this row was first written and renamed `_child_env` since — and `:4362` is really `:4540-4544`, the `BOX_LABEL` assignment with the comment that says why it is env-overridable. Both numbers are **spans as of this re-pointing, not permanent**: those two read-only files are being edited by other work in this same session, which is why every pointer here names the symbol (grep `probePath`, `_child_env`, `BOX_LABEL`) rather than trusting a bare number | `README.md` ("What ships", "Deploying it — the three verbs", "Getting a dedicated box", the test table, "Verification", "Two implementations"), `knowledge.md` (port map items 6-7, the route-bridge bullet, the new host/payload section, the parity counts), `package.json` (`#layout`, `#rust`, `#deploy`, `#ts`, `#dependencies`), `package.json` `#artifact`, `.github/workflows/ci.yml` (the header now states what CI runs and what it deliberately cannot), and the three script cites — which now name the **function** as well as the line, so the next renumbering of a file this task only reads is visible instead of silent |
+| 12 | drift this pass found in its **own** documents and scripts, after the `[[bin]]` and the deploy verbs landed: `package.json` `#layout` "owns no listener of its own", `#rust` "no vite-node pre-step", `README.md`/`knowledge.md` still describing a crate with no process of its own (a "no `[[bin]]`" / "served only by the services router" shape) and stale test totals (**137** and **148**), `.github/workflows/ci.yml:11-14` "the crate has no npm dependencies", and three drifted cites in `scripts/` | the crate owns a listener and has two hosts (bin / route file); the cargo verbs need no pre-step but the three deploy verbs are `vite-node`; the totals are **175** (173 + 2 doctests, per the run recorded under README "Verification"); the crate still has no npm dependencies, but **the package now does** (`@config/vault`, `@services/daytona`, for the scripts only); `contract.rs` is really the `probePath` bullet of the `generic` profile's defaults doc (`contract.rs` as this row is re-pointed today — the TCP-readiness rule, not a function); `modal-sandbox-container.py:1835` was really `:1895-1899`, the child-env builder — named `_runtime_env` when this row was first written and renamed `_child_env` since; **that Python runner no longer exists** (the runtime is the Rust `runtime-server`, T31), so its span is history only and `_child_env` is not a live symbol — and `:4362` is the `BOX_LABEL` assignment (`:4540-4544` when this row was written, `:343-345` today), with the comment that says why it is env-overridable. Both numbers are **spans as of this re-pointing, not permanent**: those two read-only files are being edited by other work in this same session, which is why every pointer here names the symbol (grep `probePath`, `_child_env`, `BOX_LABEL`) rather than trusting a bare number | `README.md` ("What ships", "Deploying it — the three verbs", "Getting a dedicated box", the test table, "Verification", "Two implementations"), `knowledge.md` (port map items 6-7, the route-bridge bullet, the new host/payload section, the parity counts), `package.json` (`#layout`, `#rust`, `#deploy`, `#ts`, `#dependencies`), `package.json` `#artifact`, `.github/workflows/ci.yml` (the header now states what CI runs and what it deliberately cannot), and the three script cites — which now name the **function** as well as the line, so the next renumbering of a file this task only reads is visible instead of silent |
 
-| 13 | the same drift, one pass later, and this time inside **this package's own test and doc history**: the `create opts` bullet of `scripts/start-daytona.test.ts` (the cite sits at `:14` today) cited `setup-sandbox.ts:1565-1590`, the `summary` bullet (the cite sits at `:30` today) cited `runtime-deploy.ts:1579-1591` (both bodies had moved again), the same file's cargo comment (now `:387`) cited `runtime-deploy.ts:874-899`, row 12's own "really" numbers had been overtaken by the same churn, and README's closing drift note cited `scripts/deploy-endpoint.ts:154` and `:437`. Separately: the two `--out` tests asserted `resolve('Temp/out.tar.gz')`, which **cannot fail** — vitest's cwd is the repo root, so the buggy cwd answer and the correct repo-root answer are the same string | `createSandbox` is `setup-sandbox.ts:1565-1587` (the whole arrow, `};` at `:1587`; the `:1586` reported a pass earlier is the `};` that closes the **returned object**), `buildPublicUrl` is `runtime-deploy.ts:1579-1587`, `cargoArtifactCandidates` is `runtime-deploy.ts:874-898` (doc `:874-880` + body `:881-898`), and `RUNNER_PORT` is still `setup-sandbox.ts:234`; the two provider-script comments are `deploy-endpoint.ts:150-157` (`DEFAULT_PORT`) and `:438-445` (`portCollisionNotes`), and the start-modal comment is `start-modal.ts:27-30`; `_child_env` is `:1895-1899` and `BOX_LABEL` `:4540-4544` — so the production scripts' own cites (`:1894-1898`, `:4539-4543`) are now one line low, left for a pass that may write `scripts/*.ts`; the vitest totals are **86** (83 + 3 new `resolveOutPath` tests), proven against the bug by flipping `join(repoRoot, value)` back to `resolve(value)`: 5 tests fail with received `packages/typecrate/provider/Temp/out.tar.gz`, and the implementation was restored byte-identically (sha256 `2b0f2fd6…a8c6`) | `scripts/start-daytona.test.ts` (the two header cites and the cargo comment, each now naming `createSandbox` / `buildPublicUrl` / `cargoArtifactCandidates`), `scripts/deploy-endpoint.test.ts` (a `describe('resolveOutPath')` block and a `withCwd` fake — the `--out` flow tests now assert the literal `join(REPO_ROOT, …)` while the cwd is faked to the PACKAGE root, which is where `yarn workspace @typecrate/provider deploy:endpoint` actually starts), `README.md` (the `_child_env` span, the **86** totals, the closing drift note re-pointed at the declarations), and `knowledge.md` (the two port-map bullets, the two vitest totals, row 12 above, and this row) |
+| 13 | the same drift, one pass later, and this time inside **this package's own test and doc history**: the `create opts` bullet of `scripts/start-daytona.test.ts` (the cite sits at `:14` today) cited `setup-sandbox.ts:1565-1590`, the `summary` bullet (the cite sits at `:30` today) cited `runtime-deploy.ts:1579-1591` (both bodies had moved again), the same file's cargo comment (now `:387`) cited `runtime-deploy.ts:874-899`, row 12's own "really" numbers had been overtaken by the same churn, and README's closing drift note cited `scripts/deploy-endpoint.ts:154` and `:437`. Separately: the two `--out` tests asserted `resolve('Temp/out.tar.gz')`, which **cannot fail** — vitest's cwd is the repo root, so the buggy cwd answer and the correct repo-root answer are the same string | `createSandbox` is `setup-sandbox.ts:1565-1587` (the whole arrow, `};` at `:1587`; the `:1586` reported a pass earlier is the `};` that closes the **returned object**), `buildPublicUrl` is `runtime-deploy.ts:1579-1587`, `cargoArtifactCandidates` is `runtime-deploy.ts:874-898` (doc `:874-880` + body `:881-898`), and `RUNNER_PORT` is still `setup-sandbox.ts:234`; the two provider-script comments are `deploy-endpoint.ts:150-157` (`DEFAULT_PORT`) and `:438-445` (`portCollisionNotes`), and the start-modal comment is `start-modal.ts:27-30`; `_child_env` was `:1895-1899` and `BOX_LABEL` `:4540-4544` at that time — both are **history**: the Python runner was replaced by the Rust `runtime-server` (T31), and `BOX_LABEL` is `:343-345` today — so the production scripts' own cites (`:1894-1898`, `:4539-4543`) were then one line low; T36 re-pointed the live ones by symbol (`BOX_LABEL`, `_state_path`); the vitest totals are **86** (83 + 3 new `resolveOutPath` tests), proven against the bug by flipping `join(repoRoot, value)` back to `resolve(value)`: 5 tests fail with received `packages/typecrate/provider/Temp/out.tar.gz`, and the implementation was restored byte-identically (sha256 `2b0f2fd6…a8c6`) | `scripts/start-daytona.test.ts` (the two header cites and the cargo comment, each now naming `createSandbox` / `buildPublicUrl` / `cargoArtifactCandidates`), `scripts/deploy-endpoint.test.ts` (a `describe('resolveOutPath')` block and a `withCwd` fake — the `--out` flow tests now assert the literal `join(REPO_ROOT, …)` while the cwd is faked to the PACKAGE root, which is where `yarn workspace @typecrate/provider deploy:endpoint` actually starts), `README.md` (the `_child_env` span, the **86** totals, the closing drift note re-pointed at the declarations), and `knowledge.md` (the two port-map bullets, the two vitest totals, row 12 above, and this row) |
+| 14 | the three deploy verbs still described runtime **v1**: `deploy-endpoint.ts` declared a fixed `config.port: 8800`, no app name/`targetPrefix`, and POSTed `/` with a `--env PORT` warning; `start-daytona.ts` minted a second `getPreviewLink(<payload port>)` URL/token; start-modal's rationale assumed one occupied slot; the deploy docs asserted `GET /status` echoed `config.env` verbatim and readiness was a bare TCP connect | sandbox runtime v2 is a multi-app registry (spec §4/§7): the payload must name its app (`name: 'provider'`; omitted ⇒ the shared `default` alias) and its native base (`targetPrefix: '/providers/private/v1'`), `config.port` is auto-allocated unless `--port` names one, `PORT` is a reserved env key (R-8.3/R-8.4), readiness is the bin's own `/health` probed DIRECTLY on loopback (R-8.7; `/app/provider/health` would 404 under the prefix), `TYPECRATE_PROVIDER_HOST=127.0.0.1` is supplied by the client (R-8.5), the public base is endpoint + `result.path`, and AppView redacts env VALUES (R-5.1/R-5.2) rather than echoing them | `scripts/deploy-endpoint.ts` (v2 payload identity, auto port, `reservedEnvErrors`, `resolveAdminToken`, `teardownApp`/`tailAppLogs`, app-base/health output), `scripts/start-daytona.ts` (one origin, no `getPreviewLink`, internal-only port, admin credential into `createSandbox`), `scripts/start-modal.ts` (coexisting-apps rationale), the three colocated suites (**101** tests, including targetPrefix/loopback-host regressions and the no-second-preview case), and README/knowledge deploy excerpts (the `package.json` `#deploy` note still describes the v1 config: out of this pass's file ownership) |
 
 Two things this pass deliberately did **not** claim: the retry budget (row `transport.rs:77`/`:80` in
 README's deviation table) and the SSE decoder's three one-directional leniencies (`sse.rs:54-80`) are
@@ -712,15 +739,18 @@ loud, but only at first request.
   answering exactly the four contract routes.
 - **The payload stays exactly two members, with those modes** — `typecrate-provider-server` 0755 (the
   runner execs `./<member>`, so the exec bit is not cosmetic) and `agentic-provider.json` 0644 — with
-  **no `probePath`** unless an operator opts in, and **no secret in `config.env`**, because the container's
-  `GET /status` echoes the posted config to callers that presented no secret
-  (`services/daytona/sandbox/runtime-server/src/contract.rs`). `scripts/deploy-endpoint.test.ts` pins the member
-  table and the config key-for-key; loosening any of those assertions is the regression.
+  the app name `provider`, `targetPrefix /providers/private/v1`, a loopback `/health` probe, **no
+  `config.port`** unless an operator names one, and **no secret in `config.env`**: v2's AppView exposes
+  `envKeys` and redacts values (spec R-5.1/R-5.2), and the full config is persisted in `app.json`, so a
+  credential-shaped env key is metadata even when its value is hidden. `scripts/deploy-endpoint.test.ts`
+  pins the member table and the config key-for-key; loosening any of those assertions is the regression.
 - **Importing a deploy verb must start nothing** (`scripts/entry-guard.ts`). nexus's `start-modal.ts` is
-  the counter-example (`:24-27`); under `vitest` the guard must win first, or the package's own test suite
+  the counter-example; under `vitest` the guard must win first, or the package's own test suite
   deploys.
-- **The endpoint stays a parameter** (argument > `TYPECRATE_PROVIDER_ENDPOINT` > vault): baking a box URL
-  into the package re-couples this workload to a single shared box that another workload already occupies.
+- **The endpoint stays a parameter** (argument > `TYPECRATE_PROVIDER_ENDPOINT` > vault): which box
+  receives the `provider` app is an operator decision (resources, admin auth, blast radius), and baking
+  a URL into the package re-couples this workload to a single shared origin. The deploy is app-scoped,
+  so a shared box no longer forces the exclusive use it did under v1's one-slot runner.
 
 ## Staleness in the Rust top-level docs (reported, not edited)
 

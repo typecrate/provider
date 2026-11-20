@@ -172,9 +172,20 @@ describe('mainModal', () => {
         // A dry run compiles nothing and probes nothing, on either host.
         expect(hostWorld.cargo).toEqual([]);
         expect(hostWorld.err).toEqual([]);
-        expect(hostWorld.out[0]).toBe(`${PREFIX} endpoint: https://devilz-angelz--container-sandbox.us-east.modal.run\n${PREFIX}   source: @config/vault modalContainer.DevilAngel — override it with --endpoint or TYPECRATE_PROVIDER_ENDPOINT when this box is not yours to replace`);
-        // The machine line is the LAST line, and it names the box the run actually used.
-        expect(JSON.parse(hostWorld.out[hostWorld.out.length - 1]!)).toMatchObject({ mode: 'deploy', endpoint: 'https://devilz-angelz--container-sandbox.us-east.modal.run', status: 'planned', port: 8800, profile: 'anonymous' });
+        expect(hostWorld.out[0]).toBe(`${PREFIX} endpoint: https://devilz-angelz--container-sandbox.us-east.modal.run\n${PREFIX}   source: @config/vault modalContainer.DevilAngel — override it with --endpoint or TYPECRATE_PROVIDER_ENDPOINT to place the provider app on a different origin`);
+        // The machine line is the LAST line, and it names the box + the app the run uses.
+        // v2 auto-allocates the internal port, so the planned summary reports port 0
+        // ("not assigned yet") and the one-origin app base.
+        expect(JSON.parse(hostWorld.out[hostWorld.out.length - 1]!)).toMatchObject({
+            mode: 'deploy',
+            endpoint: 'https://devilz-angelz--container-sandbox.us-east.modal.run',
+            name: 'provider',
+            status: 'planned',
+            publicUrl: 'https://devilz-angelz--container-sandbox.us-east.modal.run/app/provider/',
+            path: '/app/provider/',
+            port: 0,
+            profile: 'anonymous',
+        });
     });
 
     it('prefers an ambient TYPECRATE_PROVIDER_ENDPOINT over the vault, and names the env as the source', async () => {
@@ -225,11 +236,15 @@ describe('mainModal', () => {
         expect(built.members.map((member) => `${member.mode.toString(8).padStart(4, '0')} ${member.name}`)).toEqual(['0755 typecrate-provider-server', '0644 agentic-provider.json']);
         expect(built.payload.config).toEqual({
             runCmd: './typecrate-provider-server',
-            port: 8800,
             artifactPath: 'typecrate-provider-server',
             probeTimeoutSec: 120,
             stopSignal: 'SIGTERM',
-            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', RUST_LOG: 'info' },
+            probePath: '/health',
+            env: { TYPECRATE_PROVIDER_VAULT_PATH: './agentic-provider.json', TYPECRATE_PROVIDER_HOST: '127.0.0.1', RUST_LOG: 'info' },
         });
+        // The v2 identity travels WITH the payload, on every verb (start:modal simply
+        // forwards the argv; it must not lose the name or the native prefix).
+        expect(built.payload.name).toBe('provider');
+        expect(built.payload.targetPrefix).toBe('/providers/private/v1');
     });
 });

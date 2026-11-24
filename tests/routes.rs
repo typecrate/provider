@@ -31,9 +31,10 @@
 
 use std::{
     collections::VecDeque,
+    fmt,
     path::Path,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use axum::{
@@ -50,14 +51,14 @@ use tokio::net::TcpListener;
 
 use typecrate_provider::{
     client::{ClientSpec, ModelClient},
-    error::UNKNOWN_STREAM_ERROR_MESSAGE,
     pricing::{Pricing, TOKENS_PER_DOLLAR},
     registry::Registry,
     serve::{
         CHAT_COMPLETIONS_ROUTE, DEFAULT_VAULT_ARTIFACT, HANDLER_NOT_FOUND, INTERNAL_ERROR,
-        JSON_CONTENT_TYPE, MISSING_ID_ERROR, MODEL_CREATED_EPOCH, MODEL_OWNED_BY, MODELS_ROUTE,
-        MOUNT, PROVIDER_PORT, REGENERATION_COMMAND, RESPONSES_ROUTE, STATS_ROUTE, ServeState,
-        VaultSource, chat_completions, models, responses, state_from_source, stats,
+        JSON_CONTENT_TYPE, MISSING_ID_ERROR, MISSING_MODEL_FIELD_MESSAGE, MODEL_CREATED_EPOCH,
+        MODEL_OWNED_BY, MODELS_ROUTE, MOUNT, PROVIDER_PORT, REGENERATION_COMMAND, RESPONSES_ROUTE,
+        STATS_ROUTE, ServeState, VaultSource, chat_completions, models, responses,
+        state_from_source, stats,
     },
     // The sentinel frame the route appends, imported from the codec rather than restated, so the
     // assertion is against the byte string the product writes.
@@ -69,6 +70,110 @@ use typecrate_provider::{
 // The vault value this suite dials with. It appears in assertion VALUES only, never in a message this
 // file prints, because a printed credential is the one leak the port forbids.
 const SECRET: &str = "sk-test-credential-value";
+
+// ---------------------------------------------------------------------------
+// Log capture: proving the OPERATOR sees more than the wire does
+// ---------------------------------------------------------------------------
+//
+// Every other assertion in this file reads the RESPONSE, because the response is the contract. The
+// lines `serve.rs` writes to the log are the other half of the 2026-11-24 change and are invisible to
+// a response: they are the reason the deployed `unknown` became diagnosable at all. So this file
+// installs a `tracing` subscriber of its own — the same hand-written shape as the bin's
+// (`src/bin/server.rs`'s `LogSubscriber`, because `tracing-subscriber` is in no typecrate lockfile),
+// reduced to "push the message into a Vec" — and one test reads it back.
+//
+// The subscriber is GLOBAL and the suite is parallel, so assertions name a UNIQUE model id or a
+// unique detail string rather than counting lines; that is what makes them order- and race-proof.
+
+/// Every line this process has logged, in arrival order.
+fn captured() -> &'static Mutex<Vec<String>> {
+    static CAPTURED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+    CAPTURED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Installs the capturing subscriber exactly once for the test binary. A second call is expected:
+/// several tests read the log, and `set_global_default` only ever succeeds once.
+///
+/// It deliberately does NOT clear the buffer. Until 2026-11-24 this file had exactly one log reader, so
+/// clearing was safe; with two, a `clear()` from whichever test installed the subscriber can drop lines
+/// the OTHER one already needs — the harness runs tests in parallel, and a request from test B can land
+/// before test A installs. Assertions name a fragment unique to their own request instead (see the note
+/// above), which is race-proof whether or not another test's lines are in the buffer.
+fn capture_logs() {
+    let _ = tracing::subscriber::set_global_default(CaptureSubscriber);
+}
+
+/// The `message` half of one event. Everything else a `tracing` event can carry is recorded through
+/// `record_debug` by default, and the crate's own events carry a formatted message only.
+#[derive(Default)]
+struct LineVisitor {
+    message: String,
+}
+
+impl tracing_core::field::Visit for LineVisitor {
+    fn record_str(&mut self, field: &tracing_core::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message.push_str(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing_core::field::Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.message.push_str(&format!("{value:?}"));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CaptureSubscriber;
+
+impl tracing::Subscriber for CaptureSubscriber {
+    /// Everything the crate logs at `debug` or above: the failure line is `error!`, the request line
+    /// is `info!`, and the two flight lines are `debug!` — the whole point is to see all three.
+    fn enabled(&self, metadata: &tracing_core::Metadata<'_>) -> bool {
+        metadata.target().starts_with("typecrate_provider")
+            && *metadata.level() <= tracing::Level::DEBUG
+    }
+
+    // Spans are answered and dropped, exactly as the product subscriber does: nothing in this crate
+    // opens one, so a constant id with no store is the honest answer.
+    fn new_span(&self, _span: &tracing_core::span::Attributes<'_>) -> tracing_core::span::Id {
+        tracing_core::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing_core::span::Id, _values: &tracing_core::span::Record<'_>) {}
+
+    fn record_follows_from(
+        &self,
+        _span: &tracing_core::span::Id,
+        _follows: &tracing_core::span::Id,
+    ) {
+    }
+
+    fn event(&self, event: &tracing_core::Event<'_>) {
+        let mut visitor = LineVisitor::default();
+        event.record(&mut visitor);
+
+        captured()
+            .lock()
+            .expect("the capture lock")
+            .push(visitor.message);
+    }
+
+    fn enter(&self, _span: &tracing_core::span::Id) {}
+
+    fn exit(&self, _span: &tracing_core::span::Id) {}
+}
+
+/// `true` when some captured line contains EVERY fragment, so one assertion can name one line.
+fn a_line_contains(fragments: &[&str]) -> bool {
+    captured()
+        .lock()
+        .expect("the capture lock")
+        .iter()
+        .any(|line| fragments.iter().all(|fragment| line.contains(fragment)))
+}
 
 // ---------------------------------------------------------------------------
 // The scripted upstream
@@ -446,11 +551,15 @@ impl Answer {
     }
 }
 
-/// The whole provider-side fixture. The upstream's address is a build-time input only: the registry
-/// points at it, and no assertion needs to name it (a frame's target sentence is pinned in
-/// `tests/transport.rs`, where the transport's own target is observable).
+/// The whole provider-side fixture. The upstream's address is normally a build-time input only — the
+/// registry points at it and an assertion about a verdict needs no port — but it is kept, because
+/// since 2026-11-24 an IN-BAND error frame's `message` names the upstream TARGET
+/// (`upstream http://<addr>/v1/chat/completions …`, `src/error.rs::sentence`), and a byte-exact frame
+/// assertion therefore has to name it too. A frame's target sentence is still pinned primarily in
+/// `tests/transport.rs`, where the transport's own target is observable.
 struct Provider {
     address: String,
+    upstream_address: String,
     served: Arc<Upstream>,
 }
 
@@ -460,7 +569,17 @@ impl Provider {
         let (upstream_address, served) = upstream(script).await;
         let address = bind(&ServeState::Ready(registry(rows, &upstream_address))).await;
 
-        Self { address, served }
+        Self {
+            address,
+            upstream_address,
+            served,
+        }
+    }
+
+    /// The absolute origin of the scripted upstream, for a frame assertion that has to name the
+    /// target the provider dialed.
+    fn upstream_origin(&self) -> String {
+        format!("http://{}", self.upstream_address)
     }
 
     fn url(&self, path: &str) -> String {
@@ -1040,24 +1159,31 @@ async fn a_model_the_registry_does_not_have_is_a_404_naming_the_model_and_never_
         );
     }
 
-    // The label follows JS template interpolation for every shape the TypeScript can reach
-    // (`serve::model_label`): an absent key prints `undefined`, `null` prints `null`, a number or bool
-    // prints its `String()` form, and an object prints `[object Object]`.
-    for (body, label) in [
-        (json!({ "messages": [] }), "undefined"),
-        (json!({ "model": Value::Null }), "null"),
-        (json!({ "model": 7 }), "7"),
-        (json!({ "model": true }), "true"),
-        (json!({ "model": { "id": "x" } }), "[object Object]"),
-        (json!({ "model": ["a", "b"] }), "a,b"),
+    // Every shape below names a `model` this route cannot use, and they all get ONE sentence: the
+    // field was required and was not a string. What used to be pinned here was the deployed relay's
+    // JS template interpolation - an absent key printed `undefined`, `null` printed `null`, a number
+    // or bool printed its `String()` form, an object printed `[object Object]` - and only the last
+    // three were even informative. `undefined` in particular was an artefact of the implementation
+    // language rather than a reason, and it was misread in production as a caller that had sent the
+    // literal string "undefined"; the 2026-11-24 deviation replaces it with the field name, following
+    // the upstream's own answer for the same fault (`Temp/basalt-check/serve/handler.py:684-690`,
+    // `_unknown_model` -> `model is required`). The 404 itself and the bare-string envelope are still
+    // parity, and so is the `test/missing` verdict above: a model that IS a string keeps its own name.
+    for body in [
+        json!({ "messages": [] }),
+        json!({ "model": Value::Null }),
+        json!({ "model": 7 }),
+        json!({ "model": true }),
+        json!({ "model": { "id": "x" } }),
+        json!({ "model": ["a", "b"] }),
     ] {
         let answer = provider.post(CHAT_COMPLETIONS_ROUTE, body).await;
 
         assert_eq!(answer.status, StatusCode::NOT_FOUND);
         assert_eq!(
             answer.json(),
-            json!({ "error": format!("Model '{label}' not found") }),
-            "JS interpolation, spelled the way the deployed message spells it"
+            json!({ "error": MISSING_MODEL_FIELD_MESSAGE }),
+            "a `model` that is not a string is a missing field, not a model name"
         );
     }
 
@@ -1078,15 +1204,20 @@ async fn a_body_that_is_not_a_json_object_resolves_no_model_and_is_a_404() {
     //   * `[1,2]` / `7` / `"text"` parse fine and the gateway keeps them INTACT, so the 404 is not
     //     produced by folding at all: it is the route's own destructure, and
     //     `const { model } = [1,2]` / `= 7` / `= "text"` yields `undefined` WITHOUT throwing
-    //     (`private-chat-completion.ts:65-66`), so the lookup misses and the relay answers
-    //     `404 Model 'undefined' not found` (`private-chat-completion.ts:78-83`);
+    //     (`private-chat-completion.ts:65-66`), so the lookup misses and the relay answers its own
+    //     model 404 (`private-chat-completion.ts:78-83`);
     //   * `null` is the one shape that is NOT folded and does NOT reach that lookup: destructuring it
     //     throws, unwinds out of the handler, and the gateway catch answers
     //     `500 {"error":"Internal Server Error"}` (`start.ts:908-911`) — pinned by the separate
     //     `a_null_body_is_the_one_shape_the_gateway_does_not_fold` below, which is why `null` is
     //     absent from this list.
-    // Either 404 path lands on `model === undefined`, so `src/serve.rs` may fold the body into the
-    // empty document and still produce the deployed verdict: no 500, and no invented 400.
+    // Either 404 path lands on a `model` the route cannot use, so `src/serve.rs` may fold the body
+    // into the empty document and still produce the deployed VERDICT: no 500, and no invented 400.
+    // The STATUS is what this test guards. The deployed WORDING interpolated the JS value
+    // `undefined` into `Model '...<' not found'`, which is a rendering artefact of the TypeScript and
+    // not a reason, so since 2026-11-24 the body names the required field instead — deviation 5 in
+    // `src/serve.rs`, following the upstream's own `model is required` for the same fault
+    // (`Temp/basalt-check/serve/handler.py:684-690`, `_unknown_model`).
     let provider = Provider::start(&[Row::visible("test/alpha", "upstream/alpha")], vec![]).await;
 
     for body in ["", "not json", "[1,2]", "7", "\"text\""] {
@@ -1099,9 +1230,8 @@ async fn a_body_that_is_not_a_json_object_resolves_no_model_and_is_a_404() {
         );
         assert_eq!(
             answer.json(),
-            json!({ "error": "Model 'undefined' not found" }),
-            "the route's own 404 text, with the model name rendered from `undefined` \
-             (`private-chat-completion.ts:78-83`)"
+            json!({ "error": MISSING_MODEL_FIELD_MESSAGE }),
+            "a body with no usable `model` names the field, not a JS artefact"
         );
     }
 
@@ -1112,7 +1242,7 @@ async fn a_body_that_is_not_a_json_object_resolves_no_model_and_is_a_404() {
     assert_eq!(responses.status, StatusCode::NOT_FOUND);
     assert_eq!(
         responses.json(),
-        json!({ "error": "Model 'undefined' not found" }),
+        json!({ "error": MISSING_MODEL_FIELD_MESSAGE }),
         "the same fold on the same document, one route over"
     );
 
@@ -1135,6 +1265,147 @@ async fn a_body_that_is_not_a_json_object_resolves_no_model_and_is_a_404() {
         provider.served_count(),
         0,
         "a malformed body never reaches the upstream"
+    );
+}
+
+/// The operator half of the 2026-11-24 missing-`model` deviation. The 404 BODY now says the FIELD was
+/// wrong, which is right for the caller but leaves the operator three indistinguishable faults — a
+/// client that sent `{}`, one that sent a non-string, and one whose body never parsed. The `warn!`
+/// tells them apart (`src/serve.rs`, `warn_missing_model_field`), and the constraint that comes with
+/// it is what this test exists to defend: key NAMES, never content, never a credential value.
+#[tokio::test]
+async fn a_body_naming_no_model_warns_with_key_names_and_never_with_content() {
+    capture_logs();
+
+    let provider = Provider::start(&[Row::visible("test/alpha", "upstream/alpha")], vec![]).await;
+
+    // (1) A parseable object: the route, the byte count and the SORTED top-level key names. The names
+    // are unique to this test (`zz_probe_*`) because the capture buffer is process-global and the
+    // harness is parallel; the joined fragment also pins the order, which is what makes the line
+    // greppable at all (`serde_json` would otherwise name them in insertion order).
+    let object = provider
+        .post(
+            CHAT_COMPLETIONS_ROUTE,
+            json!({ "zz_probe_stream": false, "zz_probe_messages": [] }),
+        )
+        .await;
+
+    assert_eq!(object.status, StatusCode::NOT_FOUND);
+    assert!(
+        a_line_contains(&[
+            "chat-completion: refused 404, the body named no usable `model` field;",
+            "zz_probe_messages, zz_probe_stream",
+            "2 top-level key(s)",
+            "bytes",
+        ]),
+        "the key-name line never printed: {:?}",
+        captured().lock().expect("the capture lock")
+    );
+
+    // (2) A body that is not JSON says so, instead of being credited with an invented key list.
+    let not_json = provider.post_raw(CHAT_COMPLETIONS_ROUTE, "not json").await;
+
+    assert_eq!(not_json.status, StatusCode::NOT_FOUND);
+    assert!(
+        a_line_contains(&[
+            "chat-completion: refused 404, the body named no usable `model` field;",
+            "the body is not parseable JSON",
+        ]),
+        "the not-JSON line never printed"
+    );
+
+    // (3) Valid JSON that is not an object, and an object with no keys at all: two more honest shapes,
+    // neither of which may claim a key list it does not have.
+    let array = provider.post_raw(CHAT_COMPLETIONS_ROUTE, "[1,2]").await;
+    assert_eq!(array.status, StatusCode::NOT_FOUND);
+    assert!(
+        a_line_contains(&[
+            "chat-completion: refused 404",
+            "the body is JSON but not an object",
+        ]),
+        "the non-object line never printed"
+    );
+
+    let empty = provider.post_raw(CHAT_COMPLETIONS_ROUTE, "{}").await;
+    assert_eq!(empty.status, StatusCode::NOT_FOUND);
+    assert!(
+        a_line_contains(&[
+            "chat-completion: refused 404",
+            "a JSON object with no keys at all",
+        ]),
+        "the no-keys line never printed"
+    );
+
+    // (4) The Responses surface shares the handler, and its line names ITS route token — an operator
+    // filtering by route must be able to tell the two surfaces apart.
+    let responses = provider.post_raw(RESPONSES_ROUTE, "not json").await;
+    assert_eq!(responses.status, StatusCode::NOT_FOUND);
+    assert!(
+        a_line_contains(&[
+            "responses: refused 404, the body named no usable `model` field;",
+            "the body is not parseable JSON",
+        ]),
+        "the responses-side line never printed"
+    );
+
+    // (5) THE NO-CONTENT RULE. A body with a credential-shaped KEY NAME whose VALUES are canaries: the
+    // key `authorization` must appear (a name is not a secret), and neither the credential VALUE nor a
+    // message content may appear on the line. The canary is asserted over the WHOLE buffer — it is
+    // unique to this test, so "nowhere" is the strong statement — while the credential value is
+    // asserted over this request's own warn lines, which is the constraint `warn_missing_model_field`
+    // actually makes.
+    let with_content = provider
+        .post(
+            CHAT_COMPLETIONS_ROUTE,
+            json!({
+                "zz_probe_authorization": SECRET,
+                "zz_probe_messages": [{ "role": "user", "content": "the-canary-content-must-not-be-logged" }],
+                "zz_probe_stream": true,
+            }),
+        )
+        .await;
+
+    assert_eq!(with_content.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        with_content.json(),
+        json!({ "error": MISSING_MODEL_FIELD_MESSAGE }),
+        "a `model` key that is absent among other real keys is still the missing-field 404"
+    );
+
+    let lines = captured().lock().expect("the capture lock").clone();
+    let warned: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("zz_probe_authorization"))
+        .collect();
+
+    assert_eq!(
+        warned.len(),
+        1,
+        "exactly one warn line must name this request, and it must name its key names: {lines:?}"
+    );
+    assert!(
+        warned[0].contains("zz_probe_messages") && warned[0].contains("zz_probe_stream"),
+        "every top-level key name belongs on the line: {}",
+        warned[0]
+    );
+
+    for line in &lines {
+        assert!(
+            !line.contains("the-canary-content-must-not-be-logged"),
+            "message CONTENT reached the log: {line}"
+        );
+    }
+
+    assert!(
+        !warned[0].contains(SECRET),
+        "a credential VALUE reached the warn line: {}",
+        warned[0]
+    );
+
+    assert_eq!(
+        provider.served_count(),
+        0,
+        "none of this reached the upstream"
     );
 }
 
@@ -1329,13 +1600,18 @@ async fn a_mid_stream_error_frame_is_one_frame_and_no_sentinel_follows_it() {
     // (`start.ts`'s supervisor writes the frame and returns, and `serve.rs`'s `Err` arm sets `finished`, so
     // the sentinel can never follow).
     //
-    // The classification itself is pinned in `tests/transport.rs:1470-1522`: an error object with no HTTP
-    // status is the `unknown` class, whose message is the frozen legacy constant. What THIS test pins is
-    // that the route writes exactly that frame, byte for byte, with `param` present, `status` and `errno`
-    // absent, and nothing after it.
+    // The classification itself is pinned in `tests/transport.rs:1470-1600`: an error object with no
+    // status and no recognised class is the `unknown` class, whose message LEADS with the frozen
+    // legacy constant and tails the upstream's own sentence (2026-11-24). What THIS test pins is that
+    // the route writes exactly that frame, byte for byte, with `param` present, `status` and `errno`
+    // absent, and nothing after it. The class it names is `insufficient_quota` — a real OpenAI class
+    // the closed table deliberately refuses to price; the throttling spelling next door
+    // (`rate_limit_error`) JOINED that table on 2026-11-24, so a frame carrying it is now
+    // `upstream_status` + 429 and would pin a different contract (see
+    // `an_in_band_error_class_infers_only_a_listed_status_and_a_number_always_wins`).
     const CHUNK: &str =
         r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"he"}}]}"#;
-    const ERROR: &str = r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
+    const ERROR: &str = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details","type":"insufficient_quota","code":"insufficient_quota"}}"#;
 
     let provider = Provider::start(
         &[Row::visible("test/alpha", "upstream/alpha")],
@@ -1372,7 +1648,9 @@ async fn a_mid_stream_error_frame_is_one_frame_and_no_sentinel_follows_it() {
         frame(CHUNK),
         json!({
             "error": {
-                "message": UNKNOWN_STREAM_ERROR_MESSAGE,
+                // The frozen constant leads, and the upstream's own sentence follows it (`src/error.rs`,
+                // the `unknown` arm of `sentence`).
+                "message": "Upstream stream terminated: You exceeded your current quota, please check your plan and billing details",
                 "type": "stream_error",
                 "code": "unknown",
                 // `param` is present even though nothing produced one: the wire shape keeps every key the
@@ -1397,8 +1675,13 @@ async fn a_mid_stream_error_frame_is_one_frame_and_no_sentinel_follows_it() {
         "the frame after the failure never reached the wire: {body}"
     );
     assert!(
-        !body.contains("Rate limit exceeded"),
-        "the frame carries the classified message, not the upstream's object: {body}"
+        !body.contains("insufficient_quota"),
+        "the upstream's own CODE and CLASS are not relayed — the frame carries the classified code, \
+         and only the upstream's sentence as the detail of it: {body}"
+    );
+    assert!(
+        body.contains(r#""type":"stream_error""#),
+        "the only error class on the wire is the classified one: {body}"
     );
     assert_eq!(
         provider.served_count(),
@@ -1408,16 +1691,14 @@ async fn a_mid_stream_error_frame_is_one_frame_and_no_sentinel_follows_it() {
 }
 
 #[tokio::test]
-async fn a_mid_stream_error_frame_with_a_status_is_still_an_unknown_frame() {
-    // The other in-band shape: an error object that DOES write a `status`. It changes nothing, because
-    // the gateway cannot see that number. The SDK hands the payload to
-    // `new APIError(undefined, data.error, undefined, headers)` (`node_modules/openai/core/streaming.js:50`),
-    // and `APIError` assigns the status it is passed (`node_modules/openai/core/error.js:12`), so
-    // `err.status` is `undefined`; `readUpstreamStatus` (`start.ts:506-517`) reads only
-    // `error.status`, so `upstreamStatusCode` is `undefined`, the status arm of `classifyStreamError`
-    // (`start.ts:600-601`) does not fire, and `start.ts:644` leaves the `status` key out of the frame
-    // literal entirely (`start.ts:695-702`). What reaches a browser is therefore the frozen `unknown`
-    // frame, byte for byte — the frame a caller string-matches to decide whether to retry.
+async fn a_mid_stream_error_frame_with_a_status_is_an_upstream_status_frame() {
+    // The other in-band shape: an error object that DOES write a `status`. SINCE 2026-11-24 that
+    // number reaches the caller: the frame's own status is an upstream verdict, and the consumer's
+    // retry decision reads it, so `src/error.rs` lifts it instead of reproducing the SDK's loss of it
+    // (`streaming.js:50` passes `undefined`, `error.js:12` assigns that, `start.ts:506-517` then finds
+    // nothing — the chain that used to make this an `unknown` frame, kept here to record what changed
+    // and why). What still never reaches the wire is the upstream's raw envelope: only the classified
+    // sentence and the classified code go out, plus the status.
     const CHUNK: &str =
         r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"he"}}]}"#;
     const ERROR: &str = r#"{"error":{"message":"Too many requests","status":429}}"#;
@@ -1454,39 +1735,323 @@ async fn a_mid_stream_error_frame_with_a_status_is_still_an_unknown_frame() {
 
     assert_eq!(
         keys_of(&failure["error"]),
-        vec!["message", "type", "code", "param"],
-        "`status` is ABSENT for an in-band frame — it is the `upstream_status` class that stamps it, \
-         and an in-band `status` never reaches that class (`start.ts:644`, `:695-702`)"
+        vec!["message", "type", "code", "status", "param"],
+        "the `status` key is stamped, in the position `start.ts:699` puts it (`src/error.rs`, \
+         `StreamFailure::payload`)"
     );
     assert_eq!(failure["error"]["type"], "stream_error");
     assert_eq!(
-        failure["error"]["code"], "unknown",
-        "the code the frozen message belongs to (`start.ts:581-620` falls through to `unknown`)"
+        failure["error"]["code"], "upstream_status",
+        "the frame declares a status, so rule 3 of the classifier claims it"
+    );
+    assert_eq!(
+        failure["error"]["status"], 429,
+        "the number the upstream wrote, unmodified and numeric"
     );
     assert_eq!(failure["error"]["param"], Value::Null);
     assert_eq!(
-        failure["error"]["message"], UNKNOWN_STREAM_ERROR_MESSAGE,
-        "the frozen constant, NOT the upstream's own text — the frame's `message` is a wire value \
-         consumers string-match (`start.ts:656`, `:686-690`)"
+        failure["error"]["message"],
+        format!(
+            "upstream {}/v1/chat/completions returned HTTP 429 after 1 chunk: Too many requests",
+            provider.upstream_origin()
+        ),
+        "the sentence names the status, the phase and the upstream's own reason"
     );
 
-    // The whole frame, byte for byte, so no `status` and no upstream text can sneak back in.
+    // The whole frame, byte for byte.
     assert_eq!(
         frames[1],
-        "data: {\"error\":{\"message\":\"Upstream stream terminated\",\"type\":\"stream_error\",\"code\":\"unknown\",\"param\":null}}"
+        format!(
+            "data: {{\"error\":{{\"message\":\"upstream {}/v1/chat/completions returned HTTP 429 after 1 chunk: Too many requests\",\"type\":\"stream_error\",\"code\":\"upstream_status\",\"status\":429,\"param\":null}}}}",
+            provider.upstream_origin()
+        )
     );
 
     assert!(
-        !body.contains("429"),
-        "the status the upstream wrote stays off the wire entirely: {body}"
+        !body.contains("[DONE]"),
+        "no sentinel after a failure frame: {body}"
     );
-    assert!(
-        !body.contains("Too many requests"),
-        "the upstream's own text stays off the wire too: {body}"
+}
+
+#[tokio::test]
+async fn a_mid_stream_server_error_frame_is_relayed_as_a_status_carrying_refusal() {
+    // The failure the deployed gateway used to answer with a bare `unknown`: the local relay reports a
+    // dead engine IN-BAND, as `{"error":{"type":"server_error","message":"the engine stopped
+    // unexpectedly (exit code 1); the next request restarts it"}}`
+    // (`Temp/basalt-check/serve/handler.py:732-737`). There is no numeric status in that envelope, so
+    // the status comes from the class the frame names (`src/error.rs`, `UPSTREAM_TYPE_STATUSES`), and
+    // the engine's own sentence survives to the caller — which is the whole point of the change: the
+    // operator sees 500 + the reason on the wire, and the log line names the relay, the origin and the
+    // chunk count beside it.
+    const CHUNK: &str =
+        r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"he"}}]}"#;
+    const ERROR: &str = r#"{"error":{"type":"server_error","message":"the engine stopped unexpectedly (exit code 1); the next request restarts it"}}"#;
+
+    let provider = Provider::start(
+        &[Row::visible("test/alpha", "upstream/alpha")],
+        vec![Reply::Stream {
+            frames: vec![frame(CHUNK), frame(ERROR)],
+        }],
+    )
+    .await;
+
+    let answer = provider
+        .post(CHAT_COMPLETIONS_ROUTE, streaming(chat_body("test/alpha")))
+        .await;
+
+    let body = answer.text();
+    let frames: Vec<&str> = body.trim_end_matches('\n').split("\n\n").collect();
+
+    assert_eq!(
+        frames.len(),
+        2,
+        "one chunk frame and one failure frame: {body}"
+    );
+
+    let failure: Value = serde_json::from_str(
+        frames[1]
+            .strip_prefix("data: ")
+            .expect("an SSE data line")
+            .trim_end_matches('\r'),
+    )
+    .expect("the terminal frame is JSON");
+
+    assert_eq!(failure["error"]["code"], "upstream_status");
+    assert_eq!(
+        failure["error"]["status"], 500,
+        "inferred from `server_error`"
+    );
+    assert_eq!(
+        failure["error"]["message"],
+        format!(
+            "upstream {}/v1/chat/completions returned HTTP 500 after 1 chunk: the engine stopped unexpectedly (exit code 1); the next request restarts it",
+            provider.upstream_origin()
+        ),
+        "the engine's reason is on the wire, not only in the provider's log"
     );
     assert!(
         !body.contains("[DONE]"),
         "no sentinel after a failure frame: {body}"
+    );
+    assert_eq!(
+        provider.served_count(),
+        1,
+        "the stream is committed at the head, so the route retries nothing"
+    );
+}
+
+/// The failure the consumer can only act on by sending LESS, relayed the way the local Basalt server
+/// relays it mid-stream: `{"error":{"type":"server_error","message":"request exceeds the context
+/// window: prompt (N tokens) + max tokens (M) exceeds the context (C); requests are never
+/// truncated"}}` (`Temp/basalt-check/serve/handler.py:736-738` relays any engine `ERR` line as
+/// `server_error`, and `Temp/basalt-check/serve/prompt.py:21-28` is the sentence).
+///
+/// SINCE 2026-11-24 (D7, `src/error.rs`) the terminal frame is a **400**, not the 500 the
+/// `server_error` class states: the upstream answers this identical sentence with a client error on
+/// its pre-head path (`Temp/basalt-check/serve/handler.py:551-555`, and `:774-776` labels the same
+/// fault `context_length_exceeded`), and the consumer's overflow gate
+/// (`packages/underload/harness/src/engine/transport/provider-timeouts.ts`, `isContextOverflowSignal`)
+/// refuses to read an overflow behind a 5xx — so a 500 here left the request walking the whole
+/// transient ladder for a fault only a shorter request fixes. What the deviation must NOT do is touch
+/// the wording: the sentence is what a prose matcher on the consumer side reads, so it survives
+/// verbatim in `message`.
+#[tokio::test]
+async fn a_mid_stream_context_overflow_frame_is_a_400_that_keeps_its_wording() {
+    const CHUNK: &str =
+        r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"he"}}]}"#;
+    const OVERFLOW: &str = r#"{"error":{"type":"server_error","message":"request exceeds the context window: prompt (9000 tokens) + max tokens (1024) exceeds the context (8192); requests are never truncated"}}"#;
+
+    let provider = Provider::start(
+        &[Row::visible("test/alpha", "upstream/alpha")],
+        vec![Reply::Stream {
+            frames: vec![frame(CHUNK), frame(OVERFLOW)],
+        }],
+    )
+    .await;
+
+    let answer = provider
+        .post(CHAT_COMPLETIONS_ROUTE, streaming(chat_body("test/alpha")))
+        .await;
+
+    let body = answer.text();
+    let frames: Vec<&str> = body.trim_end_matches('\n').split("\n\n").collect();
+
+    assert_eq!(
+        frames.len(),
+        2,
+        "one chunk frame and one failure frame: {body}"
+    );
+    assert_eq!(frames[0], format!("data: {CHUNK}"));
+
+    let failure: Value = serde_json::from_str(
+        frames[1]
+            .strip_prefix("data: ")
+            .expect("an SSE data line")
+            .trim_end_matches('\r'),
+    )
+    .expect("the terminal frame is JSON");
+
+    assert_eq!(
+        keys_of(&failure["error"]),
+        vec!["message", "type", "code", "status", "param"],
+        "the `status` key is stamped, in the position `start.ts:699` puts it (`src/error.rs`, \
+         `StreamFailure::payload`)"
+    );
+    assert_eq!(failure["error"]["type"], "stream_error");
+    assert_eq!(
+        failure["error"]["code"], "upstream_status",
+        "the size refusal states a status, so rule 3 of the classifier claims the frame"
+    );
+    assert_eq!(
+        failure["error"]["status"], 400,
+        "the status is the one the upstream's PRE-HEAD path gives this sentence, not the 500 its \
+         `server_error` class states (`src/error.rs`, `status_declared_by_size_refusal`)"
+    );
+    assert_eq!(failure["error"]["param"], Value::Null);
+    assert_eq!(
+        failure["error"]["message"],
+        format!(
+            "upstream {}/v1/chat/completions returned HTTP 400 after 1 chunk: request exceeds the context window: prompt (9000 tokens) + max tokens (1024) exceeds the context (8192); requests are never truncated",
+            provider.upstream_origin()
+        ),
+        "the upstream's own sentence is preserved verbatim behind the status, so a prose matcher \
+         on the consumer side still fires"
+    );
+
+    // The whole frame, byte for byte.
+    assert_eq!(
+        frames[1],
+        format!(
+            "data: {{\"error\":{{\"message\":\"upstream {}/v1/chat/completions returned HTTP 400 after 1 chunk: request exceeds the context window: prompt (9000 tokens) + max tokens (1024) exceeds the context (8192); requests are never truncated\",\"type\":\"stream_error\",\"code\":\"upstream_status\",\"status\":400,\"param\":null}}}}",
+            provider.upstream_origin()
+        )
+    );
+
+    assert!(
+        !body.contains("[DONE]"),
+        "no sentinel after a failure frame: {body}"
+    );
+    assert_eq!(
+        provider.served_count(),
+        1,
+        "a 400 is still not a 404: the committed stream retries nothing here"
+    );
+
+    // THE PRECEDENCE HALF OF THE RULE: an explicit numeric `error.status` outranks the wording, both
+    // ways. A frame that WROTE 500 next to the same overflow sentence stays a 500 — the upstream
+    // stated a verdict, and this crate repeats it instead of second-guessing it.
+    const EXPLICIT: &str = r#"{"error":{"type":"server_error","status":500,"message":"request exceeds the context window: prompt (9000 tokens) + max tokens (1024) exceeds the context (8192); requests are never truncated"}}"#;
+
+    let dialled = Provider::start(
+        &[Row::visible("test/alpha", "upstream/alpha")],
+        vec![Reply::Stream {
+            frames: vec![frame(CHUNK), frame(EXPLICIT)],
+        }],
+    )
+    .await;
+
+    let answered = dialled
+        .post(CHAT_COMPLETIONS_ROUTE, streaming(chat_body("test/alpha")))
+        .await;
+
+    let body = answered.text();
+    let frames: Vec<&str> = body.trim_end_matches('\n').split("\n\n").collect();
+
+    assert_eq!(
+        frames.len(),
+        2,
+        "one chunk frame and one failure frame: {body}"
+    );
+
+    let failure: Value = serde_json::from_str(
+        frames[1]
+            .strip_prefix("data: ")
+            .expect("an SSE data line")
+            .trim_end_matches('\r'),
+    )
+    .expect("the terminal frame is JSON");
+
+    assert_eq!(failure["error"]["code"], "upstream_status");
+    assert_eq!(
+        failure["error"]["status"], 500,
+        "the number the frame wrote beats the overflow wording"
+    );
+    assert_eq!(
+        failure["error"]["message"],
+        format!(
+            "upstream {}/v1/chat/completions returned HTTP 500 after 1 chunk: request exceeds the context window: prompt (9000 tokens) + max tokens (1024) exceeds the context (8192); requests are never truncated",
+            dialled.upstream_origin()
+        ),
+        "500, not 400: the wording rule sits BELOW the number"
+    );
+}
+
+/// The operator-facing half of the 2026-11-24 change, asserted through the log rather than the body.
+///
+/// The deployed failure the user reported produced ONE usable line — `stream error in chat-completion
+/// for unknown: Upstream stream terminated` — which named neither the relay, nor the upstream's
+/// verdict, nor how much had already streamed. This test runs a request whose stream dies and reads
+/// back everything `serve.rs` wrote for it: the head line (row + relay), the two `debug!` flight
+/// lines, and the failure line with its code, origin, chunk count, status and the upstream's reason.
+///
+/// It reads the shared capture buffer, which since 2026-11-24 has a second reader
+/// ([`a_body_naming_no_model_warns_with_key_names_and_never_with_content`]); nothing clears the buffer
+/// any more, and every assertion here names a fragment unique to THIS request, which is what makes the
+/// two readable in parallel.
+#[tokio::test]
+async fn the_log_names_the_row_the_relay_and_the_failure_behind_the_frame() {
+    capture_logs();
+
+    const CHUNK: &str =
+        r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"he"}}]}"#;
+    const ERROR: &str = r#"{"error":{"type":"server_error","message":"the log probe stopped unexpectedly (exit code 7)"}}"#;
+
+    let provider = Provider::start(
+        &[Row::visible("test/logged", "upstream/logged")],
+        vec![Reply::Stream {
+            frames: vec![frame(CHUNK), frame(ERROR)],
+        }],
+    )
+    .await;
+
+    let answer = provider
+        .post(CHAT_COMPLETIONS_ROUTE, streaming(chat_body("test/logged")))
+        .await;
+
+    assert!(
+        answer.text().contains("\"code\":\"upstream_status\""),
+        "the wire keeps its coded frame regardless of the log: {}",
+        answer.text()
+    );
+
+    // (1) The one extra `info!` line, at the response head: the row and the relay, while the request
+    // is still in flight. The row names no relay here, which is the `unlabelled` rendering.
+    assert!(
+        a_line_contains(&["chat-completion: serving model=test/logged relay=unlabelled"]),
+        "the request head line never printed: {:?}",
+        captured().lock().expect("the capture lock")
+    );
+
+    // (2) The two `debug!` flight lines: the head was committed, and the upstream did produce.
+    assert!(
+        a_line_contains(&["chat-completion: stream opened model=test/logged"]),
+        "the stream-opened line never printed"
+    );
+    assert!(
+        a_line_contains(&["chat-completion: first chunk after", "model=test/logged"]),
+        "the first-chunk line never printed"
+    );
+
+    // (3) The failure line: every fact the wire sentence is not allowed to carry, plus the upstream's
+    // own reason.
+    assert!(
+        a_line_contains(&[
+            "stream error in chat-completion: code=upstream_status origin=upstream chunks=1",
+            "status=500",
+            "the log probe stopped unexpectedly (exit code 7)",
+        ]),
+        "the failure line is missing or incomplete: {:?}",
+        captured().lock().expect("the capture lock")
     );
 }
 

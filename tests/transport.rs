@@ -1467,14 +1467,23 @@ async fn the_sentinel_is_not_a_chunk_and_its_absence_is_reported() {
     assert_eq!(settlement.failure, None);
 }
 
-/// A mid-stream error frame with NO `status` is the `unknown` class, whose message is the frozen
-/// constant `Upstream stream terminated` (`start.ts:682-685`, `UNKNOWN_STREAM_ERROR_MESSAGE`) and
-/// whose payload therefore has NO `status` key at all.
+/// The residual `unknown`: an in-band error frame that declares NOTHING the classifier can use — no
+/// numeric `error.status`, no error class in `UPSTREAM_TYPE_STATUSES` (`src/error.rs`), no
+/// errno-shaped `code`, and no wording needle — stays the `unknown` class (`start.ts:581-621`, rule 9)
+/// and its payload still carries NO `status` key (`start.ts:644`, `:699`). Note what that list now
+/// excludes: a frame with a status, or with `type: server_error`/`invalid_request_error`/
+/// `rate_limit_error`/…, is `upstream_status` (see the two tests below), so this class is the narrow
+/// residue it was not before 2026-11-24 — and the table has since grown twice more, which is why the
+/// frame below names `insufficient_quota`: a real OpenAI class the closed table deliberately refuses to
+/// price. What changed even for the residue is the SENTENCE: the frozen constant stays the LEAD, so a
+/// consumer string-matching the legacy frame keeps matching, and the upstream's own text is tailed
+/// after `: ` — a deployed `unknown` that quoted nothing was the log nobody could read (`src/error.rs`,
+/// the 2026-11-24 deviation in its module header).
 #[tokio::test]
 async fn a_mid_stream_error_frame_without_a_status_is_an_unknown_code() {
     let address = provider(vec![Reply::sse(vec![
         b"data: {\"id\":\"a\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec(),
-        b"data: {\"error\":{\"message\":\"Rate limit exceeded\",\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}\n\n".to_vec(),
+        b"data: {\"error\":{\"message\":\"You exceeded your current quota, please check your plan and billing details\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}\n\n".to_vec(),
         b"data: {\"id\":\"never\"}\n\n".to_vec(),
     ])])
     .await;
@@ -1512,13 +1521,23 @@ async fn a_mid_stream_error_frame_without_a_status_is_an_unknown_code() {
         payload,
         json!({
             "error": {
-                "message": UNKNOWN_STREAM_ERROR_MESSAGE,
+                // The frozen constant LEADS and the upstream's own sentence follows it: the class
+                // may not know a code, but it is not allowed to throw away what the model server
+                // said (`src/error.rs`, the `unknown` arm of `sentence`).
+                "message": "Upstream stream terminated: You exceeded your current quota, please check your plan and billing details",
                 "type": "stream_error",
                 "code": "unknown",
                 "param": null
             }
         }),
-        "the frame exactly as `start.ts:695-702` stamps it"
+        "the frame exactly as `start.ts:695-702` stamps it, with the 2026-11-24 detail tail"
+    );
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .starts_with(UNKNOWN_STREAM_ERROR_MESSAGE),
+        "the legacy prefix is intact for a consumer that string-matches it"
     );
     assert_eq!(
         payload["error"]
@@ -1543,23 +1562,25 @@ async fn a_mid_stream_error_frame_without_a_status_is_an_unknown_code() {
     assert_eq!(settlement.failure, Some(failure));
 }
 
-/// The same frame WITH a `status`: it is STILL the `unknown` class, because a status written INSIDE a
-/// 200 stream body is not a status the deployed gateway can read.
+/// An in-band `{"error":{…}}` frame that WRITES a `status` is now the `upstream_status` class, and
+/// the frame carries that `status` key on the wire.
 ///
-/// The chain, verified on 2026-11-19: the SDK wraps an in-band `{"error":{…}}` payload in
+/// THE RULE THIS REPLACED, AND WHY IT CHANGED ON 2026-11-24. Until then this crate reproduced the
+/// SDK byte for byte: the SDK wraps an in-band payload in
 /// `new APIError(undefined, data.error, undefined, response.headers)`
 /// (`node_modules/openai/core/streaming.js:50`) — the third argument is the status, and `APIError`
 /// assigns exactly what it is given (`node_modules/openai/core/error.js:12`), so `err.status` is
-/// `undefined`. `readUpstreamStatus` (`packages/underload/service/src/server/start.ts:506-517`) only
-/// reads `error.status` off the thrown object, so `upstreamStatusCode` stays `undefined`, the status
-/// arm of `classifyStreamError` (`start.ts:600-601`) cannot fire, and `start.ts:644`
-/// (`const status = code === 'upstream_status' ? readUpstreamStatus(chain) : undefined`) omits the key from
-/// the frame literal (`start.ts:695-702` writes `status: typeof status === 'number' ? status : undefined`
-/// at `:699`, and `JSON.stringify` drops the key when `status` is `undefined`). So the emitted frame is
-/// byte-identical to the frame of the
-/// test above: `code: "unknown"`, the frozen message, and NO `status` key.
+/// `undefined`; `readUpstreamStatus` (`packages/underload/service/src/server/start.ts:506-517`)
+/// therefore finds nothing, the status arm of `classifyStreamError` cannot fire, and `start.ts:644`
+/// leaves the `status` key out of the frame literal. Reproducing that loss meant a verdict the model
+/// server stated plainly — 429 here, and in the field a dead engine or a rejected prompt — reached
+/// the operator as a bare `unknown`. The status an in-band frame declares IS an upstream verdict, and
+/// the consumer's retry decision reads it (`providerWireFailureOf`,
+/// `packages/underload/harness/src/engine/transport/provider-timeouts.ts:666`), so the crate now
+/// lifts it (`src/error.rs`, `FailureSignals::from_upstream_frame`). The TS gateway's own behaviour is
+/// unchanged; this crate answers more than it used to.
 #[tokio::test]
-async fn a_mid_stream_error_frame_with_a_status_stays_unknown_and_carries_no_status() {
+async fn a_mid_stream_error_frame_with_a_status_is_an_upstream_status_frame() {
     let address = provider(vec![Reply::sse(vec![
         b"data: {\"id\":\"a\"}\n\n".to_vec(),
         b"data: {\"error\":{\"message\":\"Too many requests\",\"type\":\"rate_limit\",\"status\":429}}\n\n".to_vec(),
@@ -1577,22 +1598,27 @@ async fn a_mid_stream_error_frame_with_a_status_stays_unknown_and_carries_no_sta
     let failure = failure.expect("the frame is an item");
     assert_eq!(
         failure.code(),
-        FailureKind::Unknown,
-        "an in-band `status` is not an upstream status signal (`start.ts:506-517`)"
+        FailureKind::UpstreamStatus,
+        "the status the frame declares is a status signal now (`src/error.rs`)"
     );
     assert_eq!(
         failure.status(),
-        None,
-        "the classified failure has no status, exactly as the SDK's `APIError` has none"
+        Some(StatusCode::TOO_MANY_REQUESTS),
+        "the number the upstream wrote is the emitted status, unmodified"
     );
     assert_eq!(
         failure.frame_status(),
         Some(StatusCode::TOO_MANY_REQUESTS),
-        "the number the upstream wrote is kept as a diagnostic (`src/error.rs`, \
-         `StreamFailure::frame_status`) that is never on the wire and has no reader in `src/`"
+        "and it is kept verbatim beside it (`src/error.rs`, `StreamFailure::frame_status`), which \
+         is what distinguishes a sent status from an inferred one in the log line"
     );
     assert!(failure.is_upstream());
     assert_eq!(failure.chunks(), 1, "one chunk reached the consumer first");
+    assert_eq!(
+        failure.errno(),
+        None,
+        "`rate_limit` is an upstream class, not a transport errno"
+    );
 
     let payload = failure.payload(Some("responses"));
 
@@ -1600,13 +1626,16 @@ async fn a_mid_stream_error_frame_with_a_status_stays_unknown_and_carries_no_sta
         payload,
         json!({
             "error": {
-                "message": UNKNOWN_STREAM_ERROR_MESSAGE,
+                "message": format!(
+                    "upstream http://{address}/v1/chat/completions returned HTTP 429 after 1 chunk: Too many requests"
+                ),
                 "type": "stream_error",
-                "code": "unknown",
+                "code": "upstream_status",
+                "status": 429,
                 "param": null
             }
         }),
-        "the SAME frame the status-less in-band error produces — the in-band `status` changes nothing"
+        "the sentence names the status the frame declared, and the payload stamps the `status` key"
     );
     assert_eq!(
         payload["error"]
@@ -1615,28 +1644,806 @@ async fn a_mid_stream_error_frame_with_a_status_stays_unknown_and_carries_no_sta
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["message", "type", "code", "param"],
-        "`status` is ABSENT, not null, for an in-band frame (`start.ts:644`, `:695-702`)"
+        ["message", "type", "code", "status", "param"],
+        "`status` sits between `code` and `param`, the position `start.ts:699` stamps it"
     );
     assert_eq!(
         serde_json::to_string(&payload).expect("a serialisable frame"),
-        r#"{"error":{"message":"Upstream stream terminated","type":"stream_error","code":"unknown","param":null}}"#,
-        "the exact bytes a browser reads: the 429 the upstream wrote appears nowhere in them"
+        format!(
+            r#"{{"error":{{"message":"upstream http://{address}/v1/chat/completions returned HTTP 429 after 1 chunk: Too many requests","type":"stream_error","code":"upstream_status","status":429,"param":null}}}}"#
+        ),
+        "the exact bytes a browser reads: the 429 the upstream wrote is on the wire twice, in the \
+         message and in its own key"
     );
 }
 
-/// The ONE shape that does stamp a `status`: a real HTTP verdict on the response head, i.e. a
-/// `TransportError::Status`, which is the Rust counterpart of the thrown `ApiError` whose own `status`
-/// property `readUpstreamStatus` reads (`start.ts:506-517` — the ONLY source of
-/// `upstreamStatusCode`). `start.ts:644` then emits `status`, and `start.ts:695-702` places it between
-/// `code` and `errno`/`param`.
+/// What the deployed failure actually looked like, and the whole reason the 2026-11-24 rule exists:
+/// the local relay reports a dead engine IN-BAND, as
+/// `{"error":{"type":"server_error","message":"the engine stopped unexpectedly (exit code 1)…"}}`
+/// followed by `[DONE]` (`Temp/basalt-check/serve/handler.py:732-737`), and under the SDK-parity rule
+/// that frame came out of the gateway as `code: "unknown"` with the frozen sentence and nothing else —
+/// the log line this crate used to print said only `unknown: Upstream stream terminated`.
 ///
-/// This is a PRE-STREAM verdict: the route answers the gateway's constant 500 for it
-/// (`start.ts:908-911`, `src/serve.rs` deviation 3), so the frame below is what the frame builder emits
-/// whenever a status-carrying transport failure is classified — the classification and the wire shape
-/// are pinned here because no mid-stream failure can carry a status (see the test above).
+/// It now classifies as `upstream_status` from the CLASS the frame names, the upstream's own sentence
+/// survives into the wire `message`, and the log line names every fact the frame hides.
 #[test]
-fn a_pre_stream_status_is_the_only_shape_that_stamps_a_status() {
+fn an_in_band_server_error_frame_becomes_an_upstream_status_failure() {
+    let engine_died = "the engine stopped unexpectedly (exit code 1); the next request restarts it";
+    let target = Some("https://basalt.example/v1");
+
+    let failure = StreamFailure::upstream(
+        &json!({ "type": "server_error", "message": engine_died }),
+        0,
+        target,
+    );
+
+    assert_eq!(failure.code(), FailureKind::UpstreamStatus);
+    assert_eq!(
+        failure.status(),
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+        "`server_error` states a 500 (`src/error.rs`, `UPSTREAM_TYPE_STATUSES`)"
+    );
+    assert_eq!(
+        failure.frame_status(),
+        None,
+        "the status is INFERRED, so the log must not claim the frame wrote a number"
+    );
+    assert!(
+        failure.is_upstream(),
+        "the model was reached, so this is not fatal"
+    );
+    assert_eq!(failure.chunks(), 0);
+    assert_eq!(
+        failure.detail(),
+        engine_died,
+        "the upstream's own words survive"
+    );
+
+    assert_eq!(
+        failure.sentence(Some("chat-completion")),
+        format!(
+            "upstream https://basalt.example/v1 returned HTTP 500 before the first chunk: {engine_died}"
+        )
+    );
+    assert_eq!(
+        serde_json::to_string(&failure.payload(Some("chat-completion"))).expect("a frame"),
+        format!(
+            r#"{{"error":{{"message":"upstream https://basalt.example/v1 returned HTTP 500 before the first chunk: {engine_died}","type":"stream_error","code":"upstream_status","status":500,"param":null}}}}"#
+        ),
+        "the consumer sees a coded, status-bearing frame instead of a bare `unknown`"
+    );
+    assert_eq!(
+        failure.log_line(Some("chat-completion")),
+        "stream error in chat-completion: code=upstream_status origin=upstream chunks=0 \
+         upstream=https://basalt.example/v1 status=500 \
+         detail=\"the engine stopped unexpectedly (exit code 1); the next request restarts it\"",
+        "one greppable line with the code, the origin, the chunk count, the target, the status and \
+         the reason (`src/error.rs`, `StreamFailure::log_line`)"
+    );
+
+    // An upstream that echoes the caller's key back inside its error body must not put that key in
+    // the log: `detail` is redacted at CAPTURE, and the log line quotes `detail` and nothing else.
+    let echoed = StreamFailure::upstream(
+        &json!({
+            "type": "server_error",
+            "message": "engine refused the key sk-live-secretvalue123"
+        }),
+        0,
+        target,
+    );
+
+    assert!(
+        !echoed
+            .log_line(Some("chat-completion"))
+            .contains("sk-live-secretvalue123"),
+        "a credential value reached the log line: {}",
+        echoed.log_line(Some("chat-completion"))
+    );
+    assert!(
+        echoed
+            .log_line(Some("chat-completion"))
+            .contains(REDACTION_MARKER),
+        "the redaction marker is what replaces it"
+    );
+}
+
+/// The inference table is CLOSED, and a numeric `error.status` always outranks it — both halves are
+/// the contract, because an open-ended inference would guess at vendor spellings this crate has never
+/// seen.
+#[test]
+fn an_in_band_error_class_infers_only_a_listed_status_and_a_number_always_wins() {
+    // Every row of `UPSTREAM_TYPE_STATUSES` (`src/error.rs`), asserted as data rather than sampled.
+    for (class, status) in [
+        ("server_error", 500_u16),
+        ("model_busy", 409),
+        ("invalid_request_error", 400),
+        ("authentication_error", 401),
+        ("forbidden", 403),
+        ("not_found", 404),
+        // The two rows added on 2026-11-24 after review: the class a throttling proxy relays, and the
+        // size-refusal spelling, which prices 400 — the same verdict the sentence rule and the local
+        // server's `/v1/responses` path give the identical fault
+        // (`Temp/basalt-check/serve/handler.py:774-776`), not `server_error`'s 500.
+        ("rate_limit_error", 429),
+        ("context_length_exceeded", 400),
+    ] {
+        let inferred = StreamFailure::upstream(
+            &json!({ "type": class, "message": "the relay named this class" }),
+            0,
+            None,
+        );
+
+        assert_eq!(inferred.code(), FailureKind::UpstreamStatus, "{class}");
+        assert_eq!(
+            inferred.status(),
+            Some(StatusCode::from_u16(status).expect("a status the table bounds")),
+            "{class} states {status}"
+        );
+    }
+
+    // A class outside the table infers NOTHING: `usage_limit_exceeded` is a real OpenAI spelling this
+    // crate deliberately refuses to guess a status for, so the frame keeps the old verdict.
+    let unmapped = StreamFailure::upstream(
+        &json!({ "type": "usage_limit_exceeded", "message": "Too many requests" }),
+        0,
+        None,
+    );
+
+    assert_eq!(unmapped.code(), FailureKind::Unknown);
+    assert_eq!(
+        unmapped.status(),
+        None,
+        "no number, no listed class, no status"
+    );
+
+    // A number the frame WROTE beats the class: an upstream that sends `server_error` with a 400
+    // means 400, and the number is kept verbatim as `frame_status` as well.
+    let explicit = StreamFailure::upstream(
+        &json!({ "type": "server_error", "status": 400, "message": "unknown field `foo`" }),
+        0,
+        None,
+    );
+
+    assert_eq!(explicit.code(), FailureKind::UpstreamStatus);
+    assert_eq!(explicit.status(), Some(StatusCode::BAD_REQUEST));
+    assert_eq!(explicit.frame_status(), Some(StatusCode::BAD_REQUEST));
+    assert_eq!(
+        explicit.log_line(Some("responses")),
+        "stream error in responses: code=upstream_status origin=upstream chunks=0 status=400 \
+         detail=\"unknown field `foo`\"",
+        "one status on the line when the frame's number and the emitted status agree"
+    );
+
+    // A status outside the range `readUpstreamStatus` accepts (`start.ts:506-517`: an integer in
+    // 100..=599) is not a status, and a `type` that is not a string infers nothing — both are hostile
+    // upstream shapes, and neither may throw or invent a class.
+    let out_of_range = StreamFailure::upstream(
+        &json!({ "status": 999, "message": "not a status" }),
+        0,
+        None,
+    );
+
+    assert_eq!(out_of_range.code(), FailureKind::Unknown);
+    assert_eq!(out_of_range.status(), None);
+
+    let object_type = StreamFailure::upstream(
+        &json!({ "type": { "nested": true }, "message": "a non-string class" }),
+        0,
+        None,
+    );
+
+    assert_eq!(object_type.code(), FailureKind::Unknown);
+    assert_eq!(object_type.status(), None);
+}
+
+/// The two cases where the emitted `status` and the status the frame WROTE legitimately differ, and
+/// the log line has to say both — this is why `frame_status` survived the 2026-11-24 change instead of
+/// collapsing into `status()`.
+#[test]
+fn a_status_a_stronger_rule_withholds_is_still_named_in_the_log() {
+    // An errno-shaped `code` is a TIMEOUT verdict by rule 1 of `classify_stream_error`, so the class
+    // withholds the status the frame wrote (`start.ts:643`: a status belongs to `upstream_status`
+    // alone). Without `frame_status` the upstream's own 503 would be gone from every diagnostic.
+    let timeout = StreamFailure::upstream(
+        &json!({ "code": "ETIMEDOUT", "status": 503, "message": "the engine ran out of time" }),
+        3,
+        Some("https://basalt.example/v1"),
+    );
+
+    assert_eq!(timeout.code(), FailureKind::Timeout);
+    assert_eq!(
+        timeout.status(),
+        None,
+        "the class withholds a status it is not allowed to carry"
+    );
+    assert_eq!(
+        timeout.frame_status(),
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+        "and the number the frame wrote is kept"
+    );
+    assert_eq!(timeout.errno(), Some("ETIMEDOUT"));
+    assert_eq!(
+        timeout.log_line(Some("chat-completion")),
+        "stream error in chat-completion: code=timeout origin=upstream chunks=3 \
+         upstream=https://basalt.example/v1 frame_status=503 errno=ETIMEDOUT \
+         detail=\"the engine ran out of time\"",
+        "the withheld status appears as `frame_status`, next to the errno that outranked it"
+    );
+
+    // A transport failure prints the OTHER origin, which is the fact a supervisor branches on
+    // (`src/error.rs`, `StreamOrigin`).
+    let broken = StreamFailure::transport(
+        &TransportError::Connection {
+            detail: "connection reset by peer".to_owned(),
+        },
+        0,
+        Some("https://basalt.example/v1"),
+    );
+
+    assert_eq!(
+        broken.log_line(Some("responses")),
+        "stream error in responses: code=connection origin=transport chunks=0 \
+         upstream=https://basalt.example/v1 detail=\"connection reset by peer\""
+    );
+
+    // A quote inside an upstream detail stays ONE greppable field: the log escapes `"` rather than
+    // ending the quoted value halfway through the reason.
+    let quoted = StreamFailure::upstream(&json!({ "message": "engine said \"stop\"" }), 0, None);
+
+    assert_eq!(
+        quoted.log_line(None),
+        "stream error in unknown: code=unknown origin=upstream chunks=0 \
+         detail=\"engine said \\\"stop\\\"\"",
+        "no endpoint and no target still produce a complete line"
+    );
+}
+
+/// A mid-stream size refusal must keep its WORDING on the wire, because prose is the only signal the
+/// consumer has for that class
+/// (`isContextOverflowSignal`, `packages/underload/harness/src/engine/transport/provider-timeouts.ts:467`):
+/// its gate reads `413`, `400` + wording, or NO status + wording. Dropping the upstream's sentence
+/// into the frozen constant is what made a relayed overflow unreadable, and the local server sends
+/// exactly this text (`Temp/basalt-check/serve/prompt.py:15-28`).
+///
+/// SINCE 2026-11-24 the frame also carries the **400** that gate needs beside the wording (deviation
+/// D7, `src/error.rs`, `status_declared_by_size_refusal`): the moment the relay wraps the sentence in
+/// `server_error` the class table answers 500, which that gate refuses to read as an overflow however
+/// well the prose matches — so the wording itself is a status rule, ranked below the frame's own
+/// number and above the table.
+///
+/// WHAT THE 400 DOES NOT BUY, stated because "the 400 unlocks compaction" overstates it (review, N1).
+/// The gate accepts wording ALONE when the frame carries no status, and this crate's four
+/// `CONTEXT_OVERFLOW_MARKERS` are WIDER than the consumer's eight `CONTEXT_OVERFLOW_PATTERNS`
+/// (`provider-timeouts.ts:424-433`): a sentence like the engine's raw
+/// `prompt (N tokens) + max_new (M) exceeds the context (C)` matches ours and none of its, so with our
+/// 400 attached the consumer classifies it as a plain 400 refusal — the terminal
+/// `provider-rejected` (`:751-758`), not `context-overflow` and not the compaction policy. That is
+/// still the better answer for that wording (a terminal refusal where the pre-2026-11-24 500 walked
+/// the whole 1 + 10 transient ladder), but it is a TERMINAL REFUSAL, and only a sentence in BOTH lists
+/// — anything quoting "context window", "maximum context length", "prompt is too long", — turns into
+/// compaction. The assertions below pin the frame this crate emits; the consumer's reading of it is a
+/// harness contract, pinned on the harness side.
+#[test]
+fn an_in_band_context_overflow_frame_keeps_its_wording_on_the_wire() {
+    let overflow = "request exceeds the context window: prompt (9000 tokens) + max tokens (1024) \
+                    exceeds the context (8192); requests are never truncated";
+
+    // The shape with NOTHING but the sentence: no number, no class, no errno. SINCE 2026-11-24 (D7,
+    // `src/error.rs`, `status_declared_by_size_refusal`) the sentence alone is a verdict, and the
+    // verdict is 400 — the same status the upstream gives this identical message when the refusal
+    // happens BEFORE the response head (`Temp/basalt-check/serve/handler.py:551-555`, the
+    // `ValueError` -> 400 / `invalid_request_error` arm; `Temp/basalt-check/serve/prompt.py:15-28` is
+    // where the two sentences are raised). Until that date this frame was the `unknown` residue with
+    // no `status` key at all, which the consumer could only retry.
+    let bare = StreamFailure::upstream(&json!({ "message": overflow }), 0, None);
+
+    assert_eq!(
+        bare.code(),
+        FailureKind::UpstreamStatus,
+        "a message that names a size refusal states a status, so the declared-status rescue claims \
+         the frame (`src/error.rs`, rule 9 — nothing in rules 1-8 names this sentence)"
+    );
+    assert_eq!(
+        bare.status(),
+        Some(StatusCode::BAD_REQUEST),
+        "400, because the remedy is a smaller request, not more time"
+    );
+    assert_eq!(
+        bare.frame_status(),
+        None,
+        "the status is INFERRED from the wording, so the log must not claim the frame wrote a number"
+    );
+    assert_eq!(bare.detail(), overflow, "the engine's words survive");
+    assert_eq!(
+        bare.sentence(Some("chat-completion")),
+        format!(
+            "stream from endpoint chat-completion returned HTTP 400 before the first chunk: {overflow}"
+        )
+    );
+    assert_eq!(
+        serde_json::to_string(&bare.payload(Some("chat-completion"))).expect("a frame"),
+        format!(
+            r#"{{"error":{{"message":"stream from endpoint chat-completion returned HTTP 400 before the first chunk: {overflow}","type":"stream_error","code":"upstream_status","status":400,"param":null}}}}"#
+        ),
+        "the frame's `message` carries the size refusal, so a prose matcher can fire on it, and the \
+         status the consumer's overflow gate needs is on the same frame"
+    );
+    assert!(
+        bare.payload(Some("chat-completion"))["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("context window"),
+        "the needle the consumer matches is in the emitted message, not only in the log"
+    );
+
+    // The shape the local server ACTUALLY sends mid-stream: the same sentence inside a
+    // `server_error` envelope (`Temp/basalt-check/serve/handler.py:736-738` — an engine `ERR` line is
+    // relayed as `server_error`, under that arm's own comment "engine ERR after the stream started:
+    // no 400 now"). The wording rule outranks the class table, so this is a 400 as well: the class is
+    // what the RELAY stamps on every engine fault, which is exactly why it is too coarse to decide
+    // this case and the sentence is not.
+    let enveloped = StreamFailure::upstream(
+        &json!({ "type": "server_error", "message": overflow }),
+        1,
+        Some("https://basalt.example/v1"),
+    );
+
+    assert_eq!(enveloped.code(), FailureKind::UpstreamStatus);
+    assert_eq!(
+        enveloped.status(),
+        Some(StatusCode::BAD_REQUEST),
+        "`server_error` alone would say 500; the size-refusal wording outranks it (D7)"
+    );
+    assert_eq!(
+        serde_json::to_string(&enveloped.payload(Some("chat-completion"))).expect("a frame"),
+        format!(
+            r#"{{"error":{{"message":"upstream https://basalt.example/v1 returned HTTP 400 after 1 chunk: {overflow}","type":"stream_error","code":"upstream_status","status":400,"param":null}}}}"#
+        )
+    );
+}
+
+/// The size-refusal marker list is CLOSED, and a numeric `error.status` outranks it — both halves are
+/// the contract, because an open-ended prose match would guess at vendor wording this crate has never
+/// seen, and a wording rule above the number would overrule a verdict the upstream actually stated.
+#[test]
+fn a_size_refusal_wording_infers_only_a_400_and_a_number_always_outranks_it() {
+    // Every row of `CONTEXT_OVERFLOW_MARKERS` (`src/error.rs`), asserted as data rather than sampled.
+    // The sentences are the relay's and the engine's own wordings, not paraphrases:
+    //   * `Temp/basalt-check/serve/tests/test_protocol_facts.py:21-23` pins the engine's `ERR` line
+    //     for `context_overflow`, `context_no_room` and the per-slot variant;
+    //   * `Temp/basalt-check/serve/prompt.py:15-28` is the server's rewrite of the first two
+    //     (`room_error` / `overflow_error`), which is what a chat client sees on the pre-head path.
+    for (marker, message) in [
+        (
+            "context_overflow",
+            "context_overflow prompt=5000 max_new=20 context=4096: the prompt does not fit",
+        ),
+        (
+            "context_no_room",
+            "context_no_room prompt=4090 context=4096: no room left",
+        ),
+        (
+            "exceeds the context",
+            "request exceeds the context window: prompt (5000 tokens) + max tokens (20) exceeds the context (4096); requests are never truncated",
+        ),
+        (
+            "leaves no room to answer",
+            "request exceeds the context window: prompt (4090 tokens) leaves no room to answer in the context (4096); requests are never truncated",
+        ),
+    ] {
+        let refusal = StreamFailure::upstream(&json!({ "message": message }), 0, None);
+
+        assert_eq!(refusal.code(), FailureKind::UpstreamStatus, "{marker}");
+        assert_eq!(
+            refusal.status(),
+            Some(StatusCode::BAD_REQUEST),
+            "{marker} states the 400"
+        );
+        assert_eq!(
+            refusal.frame_status(),
+            None,
+            "{marker} is inferred, so the frame still wrote no number"
+        );
+    }
+
+    // Case-insensitive, like every other text rule in this module.
+    let shouted = StreamFailure::upstream(
+        &json!({ "message": "REQUEST EXCEEDS THE CONTEXT (4096)" }),
+        0,
+        None,
+    );
+
+    assert_eq!(shouted.code(), FailureKind::UpstreamStatus);
+    assert_eq!(shouted.status(), Some(StatusCode::BAD_REQUEST));
+
+    // A number the frame WROTE outranks the wording, in BOTH directions. `status: 500` beside overflow
+    // wording is a 500 — the upstream stated a verdict and this crate repeats it rather than
+    // second-guessing it, which is the same reason the number outranks the class table.
+    let explicit_500 = StreamFailure::upstream(
+        &json!({ "type": "server_error", "status": 500, "message": "request exceeds the context window: prompt (9000 tokens) + max tokens (1024) exceeds the context (8192)" }),
+        1,
+        Some("https://basalt.example/v1"),
+    );
+
+    assert_eq!(explicit_500.code(), FailureKind::UpstreamStatus);
+    assert_eq!(
+        explicit_500.status(),
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+        "the wording rule sits BELOW the number, so an explicit 500 is NOT rewritten to 400"
+    );
+    assert_eq!(
+        explicit_500.frame_status(),
+        Some(StatusCode::INTERNAL_SERVER_ERROR)
+    );
+    assert_eq!(
+        serde_json::to_string(&explicit_500.payload(Some("chat-completion"))).expect("a frame"),
+        r#"{"error":{"message":"upstream https://basalt.example/v1 returned HTTP 500 after 1 chunk: request exceeds the context window: prompt (9000 tokens) + max tokens (1024) exceeds the context (8192)","type":"stream_error","code":"upstream_status","status":500,"param":null}}"#,
+        "the wire status is the frame's own number, and the wording is still preserved beside it"
+    );
+
+    // A number BELOW the inferred one wins too, so the rule cannot quietly upgrade a frame.
+    let explicit_418 = StreamFailure::upstream(
+        &json!({ "status": 418, "message": "exceeds the context (8192)" }),
+        0,
+        None,
+    );
+
+    assert_eq!(explicit_418.code(), FailureKind::UpstreamStatus);
+    assert_eq!(explicit_418.status(), Some(StatusCode::IM_A_TEAPOT));
+
+    // The documented NON-match, pinned so the gap in the list stays visible rather than becoming a
+    // surprise: the per-slot engine sentence `… exceeds slot S's context (C)` reaches the relay
+    // UN-rewritten (`Temp/basalt-check/serve/prompt.py:86-95`, `explain` rewrites only the coded
+    // shapes that carry full fields) and matches no marker, so it keeps the class table's verdict —
+    // here no class at all, which is the old `unknown` residue.
+    let per_slot = StreamFailure::upstream(
+        &json!({ "message": "prompt (5000 tokens) + max_new (20) exceeds slot 1's context (4096)" }),
+        0,
+        None,
+    );
+
+    assert_eq!(per_slot.code(), FailureKind::Unknown);
+    assert_eq!(
+        per_slot.status(),
+        None,
+        "the marker list is closed: prose outside it infers nothing, and the wording rules keep \
+         their chance"
+    );
+}
+
+/// THE PRECEDENCE RULE, end to end on the failure object (2026-11-24 review correction, C1): the
+/// status an in-band frame DECLARES rescues a failure nothing else named, and never overrides one the
+/// names/errno/wording rules reached. Both halves matter, and the second is the regression this closed —
+/// an earlier revision of the in-band read fed the declared status to rule 3, so a frame that had
+/// ALWAYS been `connection` became `upstream_status` and lost the consumer's short dial ladder for the
+/// codeless 1 + 10 transient one (`provider-timeouts.ts:714-721` vs `:761-790`, restated in
+/// `src/error.rs`'s module header).
+#[test]
+fn a_worded_in_band_frame_keeps_its_code_and_emits_no_status() {
+    // (a) THE CASE THE REVIEW REPORTED, byte for byte: the relay's `server_error` envelope around a
+    // sentence rule 7 already matched. The class table's 500 must not reach the wire.
+    let target = Some("https://basalt.example/v1");
+    let worded = StreamFailure::upstream(
+        &json!({ "type": "server_error", "message": "upstream stream terminated" }),
+        1,
+        target,
+    );
+
+    assert_eq!(
+        worded.code(),
+        FailureKind::Connection,
+        "the wording named it before any status was read (`src/error.rs`, rule 7)"
+    );
+    assert_eq!(
+        worded.status(),
+        None,
+        "a named class carries no status (`start.ts:643`), so the wire has no `status` key at all"
+    );
+    assert_eq!(
+        worded.frame_status(),
+        None,
+        "the frame wrote no number, so the log may not claim one"
+    );
+    assert_eq!(worded.errno(), None, "the class name is not an errno");
+    assert_eq!(
+        serde_json::to_string(&worded.payload(Some("chat-completion"))).expect("a frame"),
+        r#"{"error":{"message":"upstream https://basalt.example/v1 closed the response body after 1 chunk: upstream stream terminated","type":"stream_error","code":"connection","param":null}}"#,
+        "the frame is the one this crate emitted before the in-band status existed — `connection`, \
+         and the key set has no `status`"
+    );
+    assert_eq!(
+        worded.payload(Some("chat-completion"))["error"]
+            .as_object()
+            .expect("an error object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["message", "type", "code", "param"],
+        "no `status` between `code` and `param`"
+    );
+
+    // THE SAME FRAME WITH A NUMBER WRITTEN BESIDE THE SENTENCE: still `connection`, still no emitted
+    // status, and the number survives exactly where the field comment says it must — `frame_status`,
+    // printed on the operator's line.
+    let worded_with_number = StreamFailure::upstream(
+        &json!({ "type": "server_error", "status": 503, "message": "upstream stream terminated" }),
+        1,
+        target,
+    );
+
+    assert_eq!(worded_with_number.code(), FailureKind::Connection);
+    assert_eq!(
+        worded_with_number.status(),
+        None,
+        "the number is DECLARED, not observed, so it cannot buy this frame a status"
+    );
+    assert_eq!(
+        worded_with_number.frame_status(),
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+        "and it is the only place the upstream's 503 survives"
+    );
+    assert_eq!(
+        worded_with_number.log_line(Some("chat-completion")),
+        "stream error in chat-completion: code=connection origin=upstream chunks=1 \
+         upstream=https://basalt.example/v1 frame_status=503 \
+         detail=\"upstream stream terminated\"",
+        "the withheld status is still greppable, beside the code the wording earned"
+    );
+
+    // (b) THE WORDING-ONLY VERDICTS ARE UNCHANGED, one per wording class, each with a declared class
+    // or number present so the assertion is about PRECEDENCE and not about the needles themselves.
+    for (frame, expected) in [
+        (
+            json!({ "type": "server_error", "message": "invalid json in the relay's frame" }),
+            FailureKind::Decode,
+        ),
+        (
+            json!({ "type": "server_error", "status": 500, "message": "the engine reply timed out" }),
+            FailureKind::Timeout,
+        ),
+    ] {
+        let named = StreamFailure::upstream(&frame, 0, None);
+
+        assert_eq!(named.code(), expected, "{frame}");
+        assert_eq!(
+            named.status(),
+            None,
+            "{frame} declares a status it is not allowed to carry"
+        );
+        assert_eq!(
+            named.payload(None)["error"]
+                .as_object()
+                .expect("an error object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["message", "type", "code", "param"],
+            "{frame}: the key set is the pre-2026-11-24 one"
+        );
+    }
+}
+
+/// THE OTHER ARM OF THE SAME RULE (C1 pin (c)): with nothing in rules 1-8 to match, the declared
+/// status IS the verdict — which is the whole point of lifting it. These are the frames the deviation
+/// was added for, and the rescue is what still delivers them.
+#[test]
+fn a_frame_nothing_names_is_rescued_by_the_status_it_declares() {
+    // Class only, no message at all: the detail falls back to the object's own JSON text.
+    let bare_class = StreamFailure::upstream(&json!({ "type": "server_error" }), 0, None);
+
+    assert_eq!(bare_class.code(), FailureKind::UpstreamStatus);
+    assert_eq!(
+        bare_class.status(),
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+        "the class states 500, and nothing else had a say"
+    );
+    assert_eq!(
+        bare_class.frame_status(),
+        None,
+        "the status is inferred, so the log must not claim the frame wrote a number"
+    );
+
+    // Number only, no message and no class: the strongest declaration wins on the wire AND in
+    // `frame_status`, because the frame really wrote it.
+    let bare_number = StreamFailure::upstream(&json!({ "status": 429 }), 2, None);
+
+    assert_eq!(bare_number.code(), FailureKind::UpstreamStatus);
+    assert_eq!(bare_number.status(), Some(StatusCode::TOO_MANY_REQUESTS));
+    assert_eq!(
+        bare_number.frame_status(),
+        Some(StatusCode::TOO_MANY_REQUESTS),
+        "written, not inferred"
+    );
+    assert_eq!(
+        serde_json::to_string(&bare_number.payload(Some("responses"))).expect("a frame"),
+        r#"{"error":{"message":"stream from endpoint responses returned HTTP 429 after 2 chunks: {\"status\":429}","type":"stream_error","code":"upstream_status","status":429,"param":null}}"#,
+        "the rescue emits the `status` key the pre-2026-11-24 `unknown` frame never carried"
+    );
+}
+
+/// The shapes `error.status` arrives in, read the way BOTH deployed readers read it (C3, 2026-11-24):
+/// `readUpstreamStatus` accepts any value `Number.isInteger` takes (`start.ts:505-512`) — and JSON
+/// parses `500.0` to an integer — while the consumer's `wireStatusOf` additionally accepts a quoted
+/// three-digit string, "some proxies serialise it quoted"
+/// (`packages/underload/harness/src/engine/transport/provider-timeouts.ts:655-660`). `Value::as_u64`
+/// alone rejected the last two, so a real verdict was silently dropped to `unknown`.
+#[test]
+fn a_declared_status_is_read_from_every_shape_the_consumer_reads() {
+    for (written, status) in [
+        (json!(500), 500_u16),
+        (json!(500.0), 500),
+        (json!("500"), 500),
+        (json!(" 502 "), 502),
+        (json!("0503"), 503),
+    ] {
+        let frame = json!({ "status": written, "message": "the relay wrote a verdict" });
+        let failure = StreamFailure::upstream(&frame, 0, None);
+
+        assert_eq!(failure.code(), FailureKind::UpstreamStatus, "{frame}");
+        assert_eq!(
+            failure.status(),
+            Some(StatusCode::from_u16(status).expect("a status the range check bounds")),
+            "{written} is the status the frame declared"
+        );
+        assert_eq!(
+            failure.frame_status(),
+            Some(StatusCode::from_u16(status).expect("a status the range check bounds")),
+            "{written} was WRITTEN, so `frame_status` says so too"
+        );
+    }
+
+    // And the shapes BOTH readers refuse: a fraction, a negative, an out-of-range value in either
+    // shape, a string that is not pure ASCII digits, and every non-scalar. Dropping the status is not
+    // a fault — it leaves the wording rules and then `unknown`, exactly as before.
+    for written in [
+        json!(500.5),
+        json!(-500),
+        json!(999),
+        json!("999"),
+        json!("500.0"),
+        json!("five hundred"),
+        json!(""),
+        json!(true),
+        json!(null),
+        json!({ "code": 500 }),
+    ] {
+        let frame = json!({ "status": written, "message": "a shape this crate refuses" });
+        let failure = StreamFailure::upstream(&frame, 0, None);
+
+        assert_eq!(
+            failure.code(),
+            FailureKind::Unknown,
+            "{frame} states no status"
+        );
+        assert_eq!(failure.status(), None, "{written}");
+        assert_eq!(failure.frame_status(), None, "{written}");
+    }
+}
+
+/// The size-refusal marker is read from `error.code` as well as from the message (C4, 2026-11-24):
+/// `src/error.rs`'s own marker note describes an `error.code` written beside the message, and until
+/// this fix the ONLY read was the message, so the frame below — which says its code and nothing else —
+/// inferred the class table's 500.
+#[test]
+fn a_size_refusal_marker_written_in_error_code_is_a_400() {
+    // The frame the sentence describes: no `message` member at all, so the message half has nothing
+    // to match and only the `code` can state the verdict.
+    let coded = StreamFailure::upstream(
+        &json!({ "type": "server_error", "code": "context_overflow" }),
+        0,
+        None,
+    );
+
+    assert_eq!(coded.code(), FailureKind::UpstreamStatus);
+    assert_eq!(
+        coded.status(),
+        Some(StatusCode::BAD_REQUEST),
+        "`context_overflow` in `error.code` is the same refusal the sentence states, so it is the \
+         same 400 (`Temp/basalt-check/serve/engine/errors.py:5` `ERR_CODES`)"
+    );
+    assert_eq!(
+        coded.frame_status(),
+        None,
+        "the 400 is inferred from the code, so the log must not claim a number"
+    );
+    assert_eq!(
+        coded.errno(),
+        None,
+        "a lower-case provider code is still not a transport errno"
+    );
+
+    // Both coded markers, with real prose beside them (the shape a structured relay sends), and
+    // case-insensitively like every other text read in this module.
+    for (code, message) in [
+        ("context_no_room", "the prompt does not fit the slot"),
+        ("CONTEXT_OVERFLOW", "engine reported the prompt over budget"),
+    ] {
+        let refusal = StreamFailure::upstream(
+            &json!({ "type": "server_error", "code": code, "message": message }),
+            1,
+            None,
+        );
+
+        assert_eq!(refusal.code(), FailureKind::UpstreamStatus, "{code}");
+        assert_eq!(
+            refusal.status(),
+            Some(StatusCode::BAD_REQUEST),
+            "{code} states the 400 whatever the prose says"
+        );
+    }
+
+    // A `code` that is NOT a size marker changes nothing: the class table keeps its verdict, which is
+    // what stops this rule from becoming a general guess about vendor codes.
+    let other_code = StreamFailure::upstream(
+        &json!({ "type": "server_error", "code": "engine_offline" }),
+        0,
+        None,
+    );
+
+    assert_eq!(
+        other_code.status(),
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+        "an unrelated `code` does not move the class table's 500"
+    );
+}
+
+/// The content-free in-band error object: `{"error":{}}` on a 200 stream. It must degrade — no panic,
+/// no new code spelling, no fabricated status — and the operator line must still name the endpoint,
+/// the code, the origin and the chunk count, which is the point of a log line for a failure that has
+/// no reason in it.
+#[test]
+fn a_content_free_in_band_error_frame_degrades_without_a_new_code() {
+    let empty = StreamFailure::upstream(&json!({}), 0, None);
+
+    assert_eq!(empty.code(), FailureKind::Unknown);
+    assert_eq!(empty.status(), None);
+    assert_eq!(empty.frame_status(), None);
+    assert_eq!(empty.errno(), None);
+    // `StreamFailure::upstream` falls back to the JSON text of the object when it names no message,
+    // which is the fallback `APIError.makeMessage` uses (`core/error.js:22-27`). That text IS the
+    // detail, so the sentence is the constant plus it — and the constant's prefix is intact.
+    assert_eq!(empty.detail(), "{}");
+    assert_eq!(empty.sentence(None), "Upstream stream terminated: {}");
+    assert_eq!(
+        serde_json::to_string(&empty.payload(None)).expect("a frame"),
+        r#"{"error":{"message":"Upstream stream terminated: {}","type":"stream_error","code":"unknown","param":null}}"#,
+        "the key set is unchanged — no `status`, no invented key"
+    );
+    assert_eq!(
+        empty.log_line(Some("chat-completion")),
+        "stream error in chat-completion: code=unknown origin=upstream chunks=0 detail=\"{}\"",
+        "endpoint, code, origin and chunk count are named even when the frame said nothing"
+    );
+
+    // A scalar `error` member is the other content-free shape: the SDK stringifies it WITH its
+    // quotes, and this crate classifies it as `unknown` rather than guessing.
+    let scalar = StreamFailure::upstream(&Value::String("boom".to_owned()), 2, None);
+
+    assert_eq!(scalar.code(), FailureKind::Unknown);
+    assert_eq!(scalar.status(), None);
+    assert_eq!(scalar.detail(), "\"boom\"");
+    assert_eq!(
+        scalar.sentence(None),
+        "Upstream stream terminated: \"boom\""
+    );
+}
+
+/// A real HTTP verdict on the response head — a `TransportError::Status`, the Rust counterpart of the
+/// thrown `ApiError` whose own `status` property `readUpstreamStatus` reads (`start.ts:506-517`) —
+/// stamps a `status` too, and it always has. `start.ts:644` emits it and `start.ts:695-702` places it
+/// between `code` and `errno`/`param`.
+///
+/// This used to be the ONLY shape that could stamp one; since 2026-11-24 an in-band error frame can
+/// as well (see `a_mid_stream_error_frame_with_a_status_is_an_upstream_status_frame` above). What is
+/// still distinct here is the SOURCE: a pre-stream verdict reaches the failure as a real
+/// [`TransportError::status`] and never as `frame_status`, which the assertions below pin.
+///
+/// A pre-stream verdict is also the case the ROUTE answers with the gateway's constant 500
+/// (`start.ts:908-911`, `src/serve.rs` deviation 3), so the frame below is what the frame builder
+/// emits whenever a status-carrying transport failure is classified — the classification and the wire
+/// shape are pinned here because the route never streams one.
+#[test]
+fn a_pre_stream_status_stamps_the_status_the_response_head_carried() {
     let target = Some("https://engine.example/v1");
     let error = TransportError::Status {
         status: StatusCode::TOO_MANY_REQUESTS,
@@ -2318,11 +3125,11 @@ fn the_emitted_frames_are_the_pinned_strings() {
 fn the_frame_contract_names_the_target_the_phase_and_the_detail() {
     let target = Some("https://engine.example/v1");
 
-    // `upstream_status`: the status in the sentence and in the frame. The ONLY source of that class
-    // is a real HTTP verdict on the response head (`TransportError::Status`, the counterpart of the
-    // thrown `ApiError` whose own `status` `readUpstreamStatus` reads, `start.ts:506-517`) — an
-    // in-band frame's `status` number never gets here, see
-    // `a_mid_stream_error_frame_with_a_status_stays_unknown_and_carries_no_status`.
+    // `upstream_status`: the status in the sentence and in the frame. A real HTTP verdict on the
+    // response head (`TransportError::Status`, the counterpart of the thrown `ApiError` whose own
+    // `status` `readUpstreamStatus` reads, `start.ts:506-517`) is one source of that class; since
+    // 2026-11-24 the status an IN-BAND error frame declares is the other, pinned by
+    // `a_mid_stream_error_frame_with_a_status_is_an_upstream_status_frame`.
     let status = StreamFailure::transport(
         &TransportError::Status {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -2421,19 +3228,47 @@ fn the_frame_contract_names_the_target_the_phase_and_the_detail() {
     );
     assert_eq!(decode.code(), FailureKind::Decode);
 
-    // `unknown`: the message is the frozen constant whatever the upstream said (`start.ts:682-685`),
-    // which is what keeps every consumer that string-matches the legacy frame working.
+    // `unknown`: the frozen constant LEADS the message whatever the upstream said
+    // (`start.ts:682-685`), which is what keeps every consumer that string-matches the legacy frame
+    // working, and since 2026-11-24 the upstream's own text is tailed after `: ` — the class that
+    // cannot name a code is no longer allowed to also forget the sentence.
     let unknown = StreamFailure::upstream(
         &json!({ "message": "Something unclassifiable happened", "code": "rate_limit_exceeded" }),
         2,
         target,
     );
-    assert_eq!(unknown.sentence(None), UNKNOWN_STREAM_ERROR_MESSAGE);
+    assert_eq!(
+        unknown.sentence(None),
+        "Upstream stream terminated: Something unclassifiable happened"
+    );
+    assert!(
+        unknown
+            .sentence(None)
+            .starts_with(UNKNOWN_STREAM_ERROR_MESSAGE),
+        "the legacy prefix survives the detail tail"
+    );
     assert_eq!(unknown.code(), FailureKind::Unknown);
+    assert_eq!(
+        unknown.status(),
+        None,
+        "the frame declared no status at all"
+    );
+    assert_eq!(
+        unknown.frame_status(),
+        None,
+        "and wrote no number of its own, so the log line has nothing to distinguish"
+    );
     assert_eq!(
         unknown.detail(),
         "Something unclassifiable happened",
         "the detail half is still available for the log line"
+    );
+    assert_eq!(
+        unknown.log_line(Some("chat-completions")),
+        "stream error in chat-completions: code=unknown origin=upstream chunks=2 \
+         upstream=https://engine.example/v1 detail=\"Something unclassifiable happened\"",
+        "the operator line names the endpoint, the code, the origin, the chunk count, the target and \
+         the detail — everything the wire sentence leaves out (`src/error.rs`, `log_line`)"
     );
 
     // The route subject, which this layer cannot know and its caller supplies (`start.ts:647`).
@@ -2455,10 +3290,14 @@ fn the_frame_contract_names_the_target_the_phase_and_the_detail() {
     assert_eq!(routeless.upstream_target(), None);
 
     // The truncation guard: a VALUE the caller may ignore, classified `unknown` because nothing about
-    // it is a transport or decode signal.
+    // it is a transport or decode signal. It has a message of its own, so the frozen constant leads
+    // and that message follows it.
     let truncated = StreamFailure::truncated(2, target);
     assert_eq!(truncated.code(), FailureKind::Unknown);
-    assert_eq!(truncated.sentence(None), UNKNOWN_STREAM_ERROR_MESSAGE);
+    assert_eq!(
+        truncated.sentence(None),
+        "Upstream stream terminated: The model stream ended before reporting a completion."
+    );
     assert_eq!(
         truncated.upstream_target(),
         Some("https://engine.example/v1")
@@ -2525,6 +3364,7 @@ fn the_classifier_respects_the_precedence_ladder() {
         ],
         errno: None,
         status: Some(StatusCode::PAYLOAD_TOO_LARGE),
+        declared_status: None,
         messages: vec!["operation was aborted due to timeout".to_owned()],
     };
     assert_eq!(classify_stream_error(&racing), FailureKind::Timeout);
@@ -2584,6 +3424,42 @@ fn the_classifier_respects_the_precedence_ladder() {
         ..FailureSignals::default()
     };
     assert_eq!(classify_stream_error(&nothing), FailureKind::Unknown);
+
+    // THE DECLARED-STATUS RESCUE (2026-11-24), pinned at the ladder level as well as through the
+    // frame tests below: `declared_status` is not an OBSERVED status, so it lifts a failure ONLY when
+    // rules 1-8 produced `unknown`. The two assertions either side of that line are the whole rule.
+    let rescued = FailureSignals {
+        messages: vec!["Rate limit exceeded".to_owned()],
+        declared_status: Some(StatusCode::TOO_MANY_REQUESTS),
+        ..FailureSignals::default()
+    };
+    assert_eq!(
+        classify_stream_error(&rescued),
+        FailureKind::UpstreamStatus,
+        "a frame nothing else could name takes the verdict it declared instead of `unknown`"
+    );
+
+    // ...and the same status may NOT demote a verdict the wording rules reached. One row per wording
+    // class, because all three are the regression: `connection` was the case the review caught, and
+    // `decode`/`timeout` sit under the same rules on either side of it.
+    for (message, expected) in [
+        ("upstream stream terminated", FailureKind::Connection),
+        ("invalid json in the relay's frame", FailureKind::Decode),
+        ("the request operation timed out", FailureKind::Timeout),
+    ] {
+        let named = FailureSignals {
+            messages: vec![message.to_owned()],
+            declared_status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+            ..FailureSignals::default()
+        };
+
+        assert_eq!(
+            classify_stream_error(&named),
+            expected,
+            "{message}: a declared status never outranks a named verdict (`src/error.rs`, \
+             the rule 9 rescue)"
+        );
+    }
 
     // The SDK-shaped verdicts this crate's own errors produce, which is why
     // `TransportError::kind()` stays one implementation.

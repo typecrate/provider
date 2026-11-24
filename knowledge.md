@@ -306,22 +306,107 @@ failure shape means new `FailureSignals`, never a new kind. Redaction and the 20
 the gateway's own (`start.ts:435` (`redactSecrets`), `start.ts:346` (`MAX_ERROR_DETAIL_LENGTH`)),
 applied at capture rather than at frame-build time.
 
-**The signal the SDK does not carry, so neither does this crate.** An error that arrives INSIDE the
-stream (`data: {"error":…}`) is read by the SDK, which throws `new APIError(undefined, data.error,
-undefined, response.headers)` (`node_modules/openai/core/streaming.js:50`); the constructor
-assigns `this.status = status` (`node_modules/openai/core/error.js:12`), so the object the
-gateway classifies has **no numeric status at all**, whatever the upstream wrote in
-`error.status`. `readUpstreamStatus` (`start.ts:506-517`) therefore finds nothing, rule 3 of
-`start.ts:581-621` cannot fire, and an ordinary upstream message falls through to `unknown`:
-the frozen sentence (`:685`) and a payload with NO `status` key (`:699` writes `undefined`,
-which `JSON.stringify` drops). `FailureSignals::from_upstream_frame` mirrors the SDK object rather than
-the JSON body for exactly that reason, and `FailureSignals::frame_status` (`error.rs:624`) /
-`StreamFailure::frame_status` (`:1031`) keep the frame's own status for the log only. A `status`
-on the wire is stamped only by a PRE-stream HTTP status (`TransportError::Status`, the gate at
-`start.ts:644`). `tests/routes.rs::a_mid_stream_error_frame_with_a_status_is_still_an_unknown_frame`
-and `tests/transport.rs::a_mid_stream_error_frame_with_a_status_stays_unknown_and_carries_no_status`
-pin both halves; an earlier cut of this crate lifted the in-band status and answered `upstream_status`
-where the deployed TypeScript answers `unknown`.
+**An in-band error frame's declared status RESCUES a failure nothing else named (deviation,
+2026-11-24).** An error that arrives INSIDE the stream (`data: {"error":…}`) is read by the SDK, which
+throws `new APIError(undefined, data.error, undefined, response.headers)`
+(`node_modules/openai/core/streaming.js:50`); that constructor assigns `this.status = status`
+(`node_modules/openai/core/error.js:12`) — the `undefined` it is handed — so the object the deployed
+TypeScript gateway classifies has **no numeric status at all**, whatever the upstream wrote in
+`error.status`, `readUpstreamStatus` (`start.ts:506-517`) finds nothing, and the frame falls through
+to `unknown` with the frozen sentence (`start.ts:685`) and no `status` key (`:699`). This crate used
+to reproduce that loss byte for byte. It no longer does: an in-band error object is a real upstream
+verdict, and the consumer's retry decision reads a status
+(`providerWireFailureOf`, `packages/underload/harness/src/engine/transport/provider-timeouts.ts:666`),
+so `FailureSignals::from_upstream_frame` lifts a valid numeric `error.status` and, failing that,
+infers one from the size refusal the frame's sentence or `error.code` names or from the error CLASS it
+names (`UPSTREAM_TYPE_STATUSES`: `server_error` 500, `model_busy` 409, `invalid_request_error` 400,
+`authentication_error` 401, `forbidden` 403, `not_found` 404, `rate_limit_error` 429,
+`context_length_exceeded` 400; anything else infers nothing, and a number always wins). What the
+correction of the same day fixed is WHERE that value may be used: the three reads go into a fifth
+field, `FailureSignals::declared_status`, and only rule 9 of `classify_stream_error` consults it — the
+`unknown` fallthrough. The parity field `status` keeps its TS meaning, a status some layer OBSERVED on
+a response head, which is why rule 3 (`start.ts:601`) still reads it alone and nothing else. Consequence,
+in both directions: `{"type":"server_error","message":"upstream stream terminated"}` — and the same
+frame with `status: 503` beside the sentence — is still `connection` with NO `status` key, exactly as
+before the deviation, while a frame nothing named becomes `upstream_status` with a real `status` on the
+wire and the `unknown` class is the narrow residue that is left — whose sentence still LEADS with
+`UNKNOWN_STREAM_ERROR_MESSAGE` (the prefix consumers string-match) and now TAILS the upstream's own
+detail, because a relayed size refusal whose wording was thrown away was unreadable. WHY the ordering
+is load-bearing rather than cosmetic: the consumer reads `code` before `status`, wire `connection` gets
+the short, quickly-terminal dial ladder (`provider-timeouts.ts:714-721`, `:101-106`) and
+`upstream_status` under a non-terminal 5xx falls to the codeless 1 + 10 transient ladder
+(`:761-790`, `:118-125`) — letting the declared number win bought eleven extra attempts for a failure
+the transport had already diagnosed, which is the rule the module header names "never demote a named
+transport verdict into a longer retry ladder". `StreamFailure::frame_status` survives every case where
+the emitted status and the number the frame wrote legitimately differ — a status rules 1-8 withheld
+(errno-shaped `code` OR a wording verdict), and an inferred status the frame never sent — and
+`StreamFailure::log_line` prints whichever applies. A `status` is still stamped by a PRE-stream HTTP
+status (`TransportError::Status`, the gate at `start.ts:644`). Pinned by
+`tests/transport.rs::a_worded_in_band_frame_keeps_its_code_and_emits_no_status` (the named-verdict
+half, including the exact wire key set with no `status` member, and the withheld number on the operator
+line), `::a_frame_nothing_names_is_rescued_by_the_status_it_declares`, and at the ladder level by
+`::the_classifier_respects_the_precedence_ladder`; the accepted and refused `error.status` shapes —
+`as_u64`, an integral `as_f64`, and a trimmed ASCII-digit string, since `Value::as_u64` alone dropped
+the two shapes real proxies write — are pinned by
+`::a_declared_status_is_read_from_every_shape_the_consumer_reads`.
+
+**A message naming a size refusal is a 400, ahead of the class table (deviation D7, 2026-11-24).**
+The class table alone answers the local relay's context refusal with **500**, because the relay stamps
+`server_error` on every engine `ERR` line (`Temp/basalt-check/serve/handler.py:736-738`) — and a 500
+is a verdict the consumer can only retry, which is the wrong remedy for a prompt that is too long:
+`isContextOverflowSignal` (`packages/underload/harness/src/engine/transport/provider-timeouts.ts`)
+refuses to read matching prose as an overflow behind a 5xx, so the request walks the whole transient
+ladder for a fault only a shorter request fixes. So `status_declared_by_size_refusal` sits BETWEEN the
+numeric status and the class table and answers 400 when the frame's MESSAGE or its `error.code`
+contains any of the four case-insensitive `CONTEXT_OVERFLOW_MARKERS` (`context_overflow`,
+`context_no_room`, `exceeds the context`, `leaves no room to answer`) — the two coded words are matched
+in BOTH places, because the structured error bodies the same fault produces elsewhere carry them as a
+code (`Temp/basalt-check/serve/api/responses.py:42-43`), and reading only the message used to answer
+`{"type":"server_error","code":"context_overflow"}` with the class table's 500. WHY 400 IS NOT AN INVENTION: the upstream answers
+this identical sentence as a client error on its pre-head path — the overflow text is a `ValueError`
+and the handler's `ValueError` arm writes 400 / `invalid_request_error`
+(`Temp/basalt-check/serve/handler.py:551-555`), the `/v1/responses` arm labels the same fault
+`context_length_exceeded` (`:774-776`), and the sentences themselves are `room_error` /
+`overflow_error` (`Temp/basalt-check/serve/prompt.py:15-28`); the mid-stream arm that relays it
+in-band carries the comment "engine ERR after the stream started: no 400 now" (`:736-738`), which is
+about the transport being unable to re-send a status, not about the request's fault. Precedence is
+therefore `error.status` → size refusal → `error.type`, the number first in both directions: where the
+upstream states a verdict this crate repeats it, so `{"status":500}` beside overflow wording stays 500.
+Two limits are deliberate and pinned: the coded markers rarely fire on the served path, because the
+relay strips the code word out of the message (`Temp/basalt-check/serve/engine/process.py:178-179`),
+and the per-slot sentence `… exceeds slot S's context (C)` is NOT matched — `prompt.py:86-95` passes
+that one through un-rewritten and it contains neither needle, so it keeps the class table's verdict.
+Pinned by `tests/transport.rs::an_in_band_context_overflow_frame_keeps_its_wording_on_the_wire` and
+`::a_size_refusal_wording_infers_only_a_400_and_a_number_always_outranks_it`, and end to end on the
+wire by `tests/routes.rs::a_mid_stream_context_overflow_frame_is_a_400_that_keeps_its_wording` (which
+also pins that a frame writing `status: 500` beside the same sentence keeps its 500), and the `code`
+half by `tests/transport.rs::a_size_refusal_marker_written_in_error_code_is_a_400`. The consumer's
+gate is `isContextOverflowSignal(status, detail)`: it accepts `413`, or `400` + wording, or NO status +
+wording, and rejects every other status whatever the prose says
+(`provider-timeouts.ts:467-473`). So the 400 is what turns a RETRY into an actionable verdict — but
+"unlocks the compaction path" needs the qualifier: the gate's own `CONTEXT_OVERFLOW_PATTERNS`
+(`:424-433`) is NARROWER than this crate's four markers, so a sentence only we recognise (the engine's
+raw `prompt (N tokens) + max_new (M) exceeds the context (C)`) gets the 400 and lands on the consumer's
+terminal `provider-rejected` (`:751-758`) — a terminal refusal in place of eleven retries, not a
+smaller prompt. Only wording in BOTH lists becomes compaction, and the gate's wording-alone arm means
+the absence of a status was never what hid an overflow it could read.
+
+The three tests that pinned the old rule were rewritten for the new contract, deliberately:
+`tests/transport.rs::a_mid_stream_error_frame_with_a_status_is_an_upstream_status_frame`,
+`tests/routes.rs::a_mid_stream_error_frame_with_a_status_is_an_upstream_status_frame` and
+`tests/transport.rs::the_frame_contract_names_the_target_the_phase_and_the_detail`; the residue and
+the inference table are pinned by `an_in_band_server_error_frame_becomes_an_upstream_status_failure`,
+`an_in_band_error_class_infers_only_a_listed_status_and_a_number_always_wins`,
+`a_status_a_stronger_rule_withholds_is_still_named_in_the_log`,
+`an_in_band_context_overflow_frame_keeps_its_wording_on_the_wire` and
+`a_content_free_in_band_error_frame_degrades_without_a_new_code`. The 2026-11-24 corrections moved two
+more expectations, and each was a genuine encoding of the behaviour being replaced: the residue frames
+in `tests/transport.rs::a_mid_stream_error_frame_without_a_status_is_an_unknown_code` and
+`tests/routes.rs::a_mid_stream_error_frame_is_one_frame_and_no_sentinel_follows_it` carried
+`rate_limit_error`, which joined the status table on this date, so they now carry
+`insufficient_quota` — a real OpenAI class the table still refuses to price — and the unmapped-class
+example in `an_in_band_error_class_infers_only_a_listed_status_and_a_number_always_wins` moved from
+`rate_limit_error` to `usage_limit_exceeded` for the same reason.
 
 ### SSE and JSON: key order is contract
 
@@ -591,14 +676,31 @@ doctests are the runnable examples in `src/vault.rs:900` (`load_from_str`) and
 `clippy -- -D warnings` were re-run on this pass too and are clean. The per-target breakdown and the gap
 list are in README's [Test parity and coverage](README.md#test-parity-and-coverage).
 
+**Recount, 2026-11-24 (the in-band status, size-refusal and missing-`model` passes).** The 175 above is
+the 2026-11-19 snapshot and is now historical. `cargo test --workspace --locked --no-fail-fast` re-run
+at the end of this pass reports **186 passed / 4 failed / 0 ignored**, per target: **34 lib unit** (32
+passing, 2 failing) / 0 bin unit / 15 accounting / **19 bin_server** / 27 clients / **8 gateway** /
+**12 registry** (10 passing, 2 failing) / **22 routes** / **51 transport** / **2 doc tests**. The count
+of test attributes is **188** (`grep -rE '#\[(tokio::)?test(\(|\])' src tests`), 188 + 2 = 190 cases,
+of which 186 pass. The four failures are one pre-existing cause, not four faults: the regenerated
+`config/vault/generated/agentic-provider.json` carries more `label` members than `vault.rs` pins (53
+against 43, and 31 against 28), which fails
+`vault::tests::live_artifact_matches_the_documented_shape`,
+`vault::tests::a_credential_value_can_never_be_printed`, and the two registry tests that dial the live
+artifact's pools (`e_a_one_entry_pool_repeats_its_head_once_and_then_drains`,
+`f_a_relay_rotates_its_named_endpoints_in_document_order`). They are outside this crate's behaviour and
+the artifact is do-not-touch; `--no-fail-fast` is also required for the tally, because without it cargo
+stops at the first failing target. Note also that the doctest target only runs when cargo's configured
+`TMPDIR` (`Temp/rust`, `.cargo/config.toml:33`) exists — with it missing, `--doc` errors out with
+"failed to create temporary directory" and the two doc tests are silently absent from any total.
+
 The suite is organised around the acceptance letters recorded in `tests/registry.rs:3-16` (A4–A9), and
 its discipline is that every expectation is read out of a TypeScript or Rust source **before** the code
 ran (`tests/routes.rs:5-8`), against a real in-process listener rather than a mock
 (`tests/transport.rs:3-8`). The two new targets extend that discipline rather than break it:
 `tests/bin_server.rs` and `tests/gateway.rs` drive the **bin's own router on a real socket**, so the
 fail-fast gate, the `/health` body, the `ANY` refusals and the preflight `204` are wire facts, not
-assertions about a hand-built `Next`. Still not covered, and stated so nobody over-reads the 175: no live
-upstream, no run inside the `typecrate-services` binary (the route-file half is still pinned by literals
+assertions about a hand-built `Next`. Still not covered, and stated so nobody over-reads these figures: no live upstream, no run inside the `typecrate-services` binary (the route-file half is still pinned by literals
 and by services' own tests), no `POST /apps` / `PUT /apps/provider` to a live v2 Modal box or Daytona
 sandbox, no Daytona or Lightning **rows** (they are absent, not exercised), no HTML dashboard, no stats
 persistence, and not all 29 rows exercised individually. The npm verbs are covered separately, by
@@ -700,12 +802,54 @@ loud, but only at first request.
   (`src/serve.rs:793-838`, pinned by
   `tests/routes.rs::a_body_that_is_not_a_json_object_resolves_no_model_and_is_a_404`
   and `::a_null_body_is_the_one_shape_the_gateway_does_not_fold`).
-- An **in-band error frame carries no `status` key**: the SDK builds
-  `new APIError(undefined, message, undefined, undefined)` (`streaming.js:50`, `error.js:12`), so
-  the status that was on the frame stays a retained diagnostic that never reaches the wire and has no
-  reader in `src/` (`FailureSignals::frame_status`, `src/error.rs:1035`). Promoting it into the
-  payload is the regression
-  (`tests/transport.rs::a_mid_stream_error_frame_with_a_status_stays_unknown_and_carries_no_status`).
+  Since 2026-11-24 the **status** of that 404 is still the parity to keep and its **message** is a
+  recorded deviation (deviation 5, `src/serve.rs:96`): an absent or non-string `model` answers
+  `MISSING_MODEL_FIELD_MESSAGE`, naming the field, where the reference interpolates the JS artefact
+  `Model 'undefined' not found`. Re-introducing `undefined` is the regression — and so is turning the
+  404 into a 400, which is terminal for the consumer either way and would trade parity for nothing. A
+  string id that no row owns still answers `Model '<id>' not found` verbatim. The operator half of
+  that fault is one `warn!` with the route, the byte count and the body's **top-level key names** only
+  (`warn_missing_model_field`, `MISSING_MODEL_KEYS_SHOWN`): message content, tool payloads and
+  credential values must never enter it, a body that was not parseable JSON is reported as that
+  fact instead of as an invented key list
+  (`tests/routes.rs::a_body_naming_no_model_warns_with_key_names_and_never_with_content`), and every
+  non-whitespace **control character** is dropped from each key before the list is joined
+  (`describe_top_level_keys`) — a caller can send `"\u{1b}[31m"` as a key name, and `flatten_error_detail`
+  flattens whitespace, caps length and redacts secrets but has no opinion about the byte that turns an
+  ANSI colour on. Whitespace is deliberately left to the flattening, because that IS the reference
+  gateway's rule (`src/serve.rs::the_body_key_descriptive_names_the_count_the_sorted_names_and_the_remainder`).
+- An **in-band error frame's declared status rescues a failure nothing else named** (since
+  2026-11-24): a frame that writes `error.status` (in any shape the deployed readers accept —
+  `500`, `500.0`, `"500"`, `" 502 "`), or whose message or `error.code` names a size refusal, or which
+  names one of the eight classes in `UPSTREAM_TYPE_STATUSES`, classifies as `upstream_status` and
+  stamps the `status` key (`src/error.rs::FailureSignals::from_upstream_frame`). Reverting to the SDK's
+  loss of the number — which this crate did until that date, and which made the relay-reported verdicts
+  an unactionable `unknown` — is the regression now, and so is widening the inference beyond the closed
+  table (a guessed status for an unknown class would invent a verdict the upstream never stated). The
+  **precedence inside that rule is the other half of the contract** (D7, 2026-11-24): a numeric
+  `error.status` first, then `status_declared_by_size_refusal`, then the class table — never the other
+  way round. A status-less frame whose message matches `CONTEXT_OVERFLOW_MARKERS` MUST emit **400**,
+  not the 500 the `server_error` class would infer, because the upstream answers that same sentence
+  with a client error on its pre-head path (`Temp/basalt-check/serve/handler.py:551-555`) and the
+  consumer's overflow gate refuses an overflow behind a 5xx (`isContextOverflowSignal`). Letting the
+  class table win, rewriting a frame that DID write `status: 500`, or matching prose outside the four
+  markers is the regression. **And the whole declared-status field is a RESCUE, never an override**
+  (the correction of the same day): it travels in `FailureSignals::declared_status`, which only rule 9
+  of `classify_stream_error` reads, so rules 1-8 — names, errno, wording — decide the code first and a
+  frame they named keeps its ABSENT `status` key even when it also writes a number. Demoting
+  `{"type":"server_error","message":"upstream stream terminated"}` to `upstream_status` because its
+  class or its number says so is the regression that correction closed: the consumer reads `code`
+  before `status`, and the swap moves a failure from the short dial ladder
+  (`provider-timeouts.ts:714-721`) onto the 1 + 10 transient one (`:761-790`). The frame's
+  own number stays separately readable for every case where it legitimately differs from the
+  emitted status (`StreamFailure::frame_status`, printed by `StreamFailure::log_line`), and the
+  `unknown` class keeps `UNKNOWN_STREAM_ERROR_MESSAGE` as its sentence PREFIX even though the
+  upstream's detail now follows it — dropping the constant, or putting the detail before it, breaks
+  every consumer that string-matches the legacy frame
+  (`tests/transport.rs::a_mid_stream_error_frame_with_a_status_is_an_upstream_status_frame`,
+  `::an_in_band_error_class_infers_only_a_listed_status_and_a_number_always_wins`,
+  `::an_in_band_context_overflow_frame_keeps_its_wording_on_the_wire` and
+  `tests/routes.rs::a_mid_stream_server_error_frame_is_relayed_as_a_status_carrying_refusal`).
 - The **SSE decoder is one event, one payload**: multi-line `data:` lines join with `\n` and a
   payload that *starts with* `[DONE]` ends the stream (`src/sse.rs:164-165`, `:242-256`), because
   that is what the SDK decoder does (`streaming.js:261`, `:35`). Splitting the stream on `,`

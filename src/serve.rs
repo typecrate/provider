@@ -74,8 +74,8 @@
 //!      loop instead of by a route-level `while (true)`), and `[DONE]` after clean exhaustion.
 //!   3. **Not a deviation - recorded so the next reader does not re-open it.** A pre-stream upstream
 //!      failure is `500 {"error":"Internal Server Error"}` whatever the upstream status was, and a
-//!      body that fails to parse (or parses to an array or a scalar) is `404 Model 'undefined' not
-//!      found`. Both are the deployed gateway's own verdicts, verified against it: the endpoint never
+//!      body that fails to parse (or parses to an array or a scalar) is a `404` naming NO model. Both
+//!      are the deployed gateway's own verdicts, verified against it: the endpoint never
 //!      catches a transport error (`private-chat-completion.ts:101-104` / `:196-200` leave
 //!      `await client.create(body)` uncaught), so the throw reaches the gateway's catch, whose whole
 //!      body is `console.error` + `context.json({ error: 'Internal Server Error' }, 500)`
@@ -86,11 +86,29 @@
 //!      gateway does not fold is `null`, which throws out of that destructure and so takes the same
 //!      500 as a transport error. `tests/routes.rs` pins all four wire outcomes. What the port adds
 //!      is invisible on the wire: the pre-stream status is also *classified* (
-//!      [`crate::error::FailureSignals::upstream_status`]) and logged, where the TypeScript keeps it
+//!      [`crate::error::TransportError::kind`]) and logged, where the TypeScript keeps it
 //!      only on the thrown `APIError` (`node_modules/openai/core/error.js:12`) that the gateway
 //!      discards.
+//!      The 404 TEXT of that case is deviation 5, not this one: the status and the fall-through are
+//!      still parity, only the interpolated `<model>` is not.
 //!   4. **There is no request-body cap.** PARITY, not a deviation: the deployed gateway imposes none,
 //!      and neither does this module - a body of any size is read in full.
+//!   5. **A request whose `model` field is absent or not a string says so, instead of naming
+//!      `undefined`** (2026-11-24). DEVIATION (deliberate, recorded): the deployed relay answers
+//!      `404 {"error":"Model 'undefined' not found"}`, because its message is a JS template literal
+//!      and the destructure left `body.model` as `undefined`
+//!      (`private-chat-completion.ts:66`, `:78-83`). `undefined` is an artefact of THAT
+//!      implementation language: it is not a model id, and it does not tell the caller what was wrong
+//!      with the request - in production it was misread as a harness that had literally sent the
+//!      string `"undefined"`. The upstream's own wording for the same fault is a REQUIRED-field
+//!      message (`Temp/basalt-check/serve/handler.py:684-690` `_unknown_model` answers
+//!      `model is required`), so this route reports the fault as a fault:
+//!      [`MISSING_MODEL_FIELD_MESSAGE`]. Kept unchanged, because both are the deployed verdict and
+//!      neither depends on the interpolation: the **404** itself, and
+//!      `Model '<id>' not found` for an id that IS a string but is not served - a terminal verdict
+//!      for the consumer either way, so changing the status would buy nothing and cost parity.
+//!      The reason a warn log accompanies it (body key names, never values) is on
+//!      [`warn_missing_model_field`].
 //!
 //! # The secret rule this module is responsible for
 //!
@@ -107,6 +125,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::OnceLock;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
@@ -203,6 +222,30 @@ pub const INTERNAL_ERROR: &str = "Internal Server Error";
 
 /// `private-stats.ts:1070` - the reset verb without a usable `?id=`.
 pub const MISSING_ID_ERROR: &str = "missing id query parameter";
+
+/// The 404 body for a request that never named a model at all - deviation 5 in the module header.
+///
+/// WHY THIS SENTENCE AND NOT THE DEPLOYED ONE: the deployed relay prints
+/// `Model 'undefined' not found`, where `undefined` is what the TypeScript destructure left behind
+/// (`private-chat-completion.ts:66`) and nothing more - it is a JS rendering artefact, not a model
+/// id, and an operator reading it in production took it for a literal id named `undefined`. The
+/// upstream's own answer to the same fault states the FIELD instead
+/// (`Temp/basalt-check/serve/handler.py:684-690`, `_unknown_model` with `name is None` writes
+/// `model is required`), which is the shape this sentence keeps: a required field, and the two ways
+/// it can be wrong. It is deliberately not the upstream's exact bytes - this crate's other wire
+/// messages are its own (`INTERNAL_ERROR`, `HANDLER_NOT_FOUND`), and "missing OR not a string" is
+/// precisely what this route accepts and the upstream never has to say.
+pub const MISSING_MODEL_FIELD_MESSAGE: &str =
+    "Model field is required and was missing or not a string in the request body";
+
+/// How many top-level body key names [`warn_missing_model_field`] may name, at most.
+///
+/// WHY A CAP AT ALL: the key list is the whole diagnostic, and a caller can send a body with hundreds
+/// of keys - an unbounded line is an unbounded log record, and the tail of a long key list is not
+/// what identifies a malformed client. Sixteen is comfortably more than either request surface
+/// actually uses (`model`, `messages`, `stream`, `max_tokens`, and a handful of sampling fields), so a
+/// truncated list still names the fault, and the line says how many names it left out.
+pub const MISSING_MODEL_KEYS_SHOWN: usize = 16;
 
 /// `models/service-route.ts:42` - the catalog's frozen creation epoch.
 pub const MODEL_CREATED_EPOCH: u64 = 1_677_610_602;
@@ -560,6 +603,11 @@ fn unavailable(reason: &Unavailable) -> Response {
 /// is also why `packages/typecrate/services` does not have to grow one - it declares `json,query,ws`
 /// and compiles this module into its own binary.
 fn sse(stream: UpstreamStream, endpoint: &'static str, log: RequestLog) -> Response {
+    // The head is about to be committed, so this is the last point where the request is still
+    // describable as "alive and not yet producing". Debug-level on purpose: the operator switches to
+    // `RUST_LOG=typecrate_provider=debug` precisely to find a stream that never produced a chunk.
+    log.stream_opened(endpoint);
+
     let body = Body::from_stream(Relay::new(stream, endpoint, log));
 
     // A builder that cannot fail: the two header values are validated statics and the status is a
@@ -598,6 +646,55 @@ impl RequestLog {
             client: client.clone(),
             label: client.upstream_label(),
         }
+    }
+
+    /// The relay half every line prints: the vault entry LABEL, or the word that says the row does
+    /// not name its relays. A label is user-visible configuration already screened by
+    /// [`crate::client::upstream_label_is_safe`], never a URL and never a credential value.
+    fn relay(&self) -> &str {
+        self.label.as_deref().unwrap_or("unlabelled")
+    }
+
+    /// Names the row and the relay that served the request, at the response head.
+    ///
+    /// This is the "what is going on" line: until it prints, an operator with a request hanging in
+    /// front of a relay has NOTHING to grep for, because the token line below only arrives when the
+    /// body finishes and the failure line only when it dies. One `info!` per request, emitted at the
+    /// head for both the settled and the streaming shape, and it can only name the relay the request
+    /// actually used for the reason the struct's doc gives.
+    fn announce(&self, endpoint: &str) {
+        tracing::info!(
+            target: "typecrate_provider::serve",
+            "{endpoint}: serving model={} relay={}",
+            self.client.id(),
+            self.relay()
+        );
+    }
+
+    /// The first `debug!` flight line: the head is committed, so the request is alive.
+    ///
+    /// `RUST_LOG=typecrate_provider=debug` turns these into a trace of one request; at the default
+    /// `info` they cost nothing, which is what keeps the added output to the one line above.
+    fn stream_opened(&self, endpoint: &str) {
+        tracing::debug!(
+            target: "typecrate_provider::serve",
+            "{endpoint}: stream opened model={} relay={}",
+            self.client.id(),
+            self.relay()
+        );
+    }
+
+    /// The second `debug!` flight line: the upstream has produced its first chunk, measured from the
+    /// instant the head arrived. Absent this line, a stream that opened and then stalled looks
+    /// identical to one that never opened.
+    fn first_chunk(&self, endpoint: &str, opened: Instant) {
+        tracing::debug!(
+            target: "typecrate_provider::serve",
+            "{endpoint}: first chunk after {}ms model={} relay={}",
+            opened.elapsed().as_millis(),
+            self.client.id(),
+            self.relay()
+        );
     }
 
     /// Emits the one line the TypeScript prints per completed request.
@@ -650,6 +747,12 @@ struct Relay {
     /// Set once a terminal frame has been produced, so the sentinel and an error frame can never
     /// both reach the wire and nothing at all follows the terminal frame.
     finished: bool,
+    /// When this relay was built, i.e. when the SSE head was committed. Only the `debug!` first-chunk
+    /// line reads it, and it exists so a stalled stream is distinguishable from a stream that never
+    /// opened.
+    opened: Instant,
+    /// Set on the first upstream chunk, so the flight line is printed once and not per frame.
+    delivered: bool,
 }
 
 impl Relay {
@@ -659,6 +762,8 @@ impl Relay {
             endpoint,
             log,
             finished: false,
+            opened: Instant::now(),
+            delivered: false,
         }
     }
 }
@@ -679,16 +784,26 @@ impl Stream for Relay {
             // A chunk is RE-SERIALISED, never echoed as upstream bytes: the TypeScript does the same
             // (`private-chat-completion.ts:163 JSON.stringify(chunk)`), and `preserve_order` is what
             // keeps the upstream's own key order intact through the round trip.
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(Bytes::from(data_frame(&chunk))))),
+            Poll::Ready(Some(Ok(chunk))) => {
+                if !this.delivered {
+                    this.delivered = true;
+                    this.log.first_chunk(this.endpoint, this.opened);
+                }
+
+                Poll::Ready(Some(Ok(Bytes::from(data_frame(&chunk)))))
+            }
             Poll::Ready(Some(Err(failure))) => {
                 // The gateway logs the real error before it writes the frame (`start.ts:861`); the
-                // frame itself carries only the classified sentence.
+                // frame itself carries only the classified sentence. The line is the failure's own
+                // [`crate::error::StreamFailure::log_line`], which is what the deployed gateway
+                // lacked: it printed only the code and the sentence, so an `unknown` came out as
+                // `stream error in chat-completion for unknown: Upstream stream terminated` and
+                // named neither the relay, nor the upstream's own verdict, nor how much had already
+                // reached the caller.
                 tracing::error!(
                     target: "typecrate_provider::serve",
-                    "stream error in {} for {}: {}",
-                    this.endpoint,
-                    failure.code().as_str(),
-                    failure.sentence(Some(this.endpoint))
+                    "{}",
+                    failure.log_line(Some(this.endpoint))
                 );
 
                 this.finished = true;
@@ -841,7 +956,9 @@ pub fn health_document() -> Value {
 ///      gateway folds it into and therefore falls through to gate (4), while a body of `null` takes
 ///      the same `500` as an unreadable body because the TypeScript's destructure throws on it
 ///      (deviation 3 states the whole verification);
-///   4. an id no row owns -> `404 {"error":"Model '<model>' not found"}`, `error` a bare string;
+///   4. an id no row owns -> `404 {"error":"Model '<model>' not found"}`, `error` a bare string; a
+///      body whose `model` is absent or not a string -> the same 404 with
+///      [`MISSING_MODEL_FIELD_MESSAGE`] and one `warn!` naming the body's key names (deviation 5);
 ///   5. upstream: a settled document goes out verbatim, a stream goes out as frames, and a stream
 ///      that dies mid-flight gets one classified frame with no sentinel after it.
 ///
@@ -896,9 +1013,10 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
     // `start.ts:815` is `try { body = await context.req.json(); } catch { body = {}; }`, and the
     // non-object shapes read `undefined` for `model` exactly as an empty object does
     // (`const { model } = [1,2]` / `= 7` / `= "text"` are all `undefined` in JavaScript), so the
-    // TypeScript relay answers `404 Model 'undefined' not found` from its own lookup
-    // (`private-chat-completion.ts:75-83`). PARITY, not a deviation: the verdict is produced by
-    // falling through into gate (4) with an empty document.
+    // TypeScript relay answers its model 404 from its own lookup
+    // (`private-chat-completion.ts:75-83`). PARITY, not a deviation: the VERDICT is produced by
+    // falling through into gate (4) with an empty document, and gate (4) still answers 404. Only the
+    // WORDING of that 404 deviates, and only because `undefined` is a JS artefact - deviation 5.
     //
     // `null` is the one shape the gateway does NOT fold, because `const { model } = null` THROWS
     // (`TypeError: Cannot destructure property 'model'`) out of the handler body
@@ -908,6 +1026,11 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
     // The parse diagnostic is logged at DEBUG with the crate's redaction rules applied (a request
     // body can echo a credential), so the fault stays observable without the body ever reaching the
     // wire.
+    //
+    // The parse OUTCOME is kept apart from the document: gate (4) reports a missing `model`
+    // differently depending on whether the body had keys to name at all (deviation 5), and once the
+    // fold below has run, an empty document can no longer tell those three cases apart.
+    let mut shape = BodyShape::Object;
     let document = match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Null) => {
             tracing::debug!(
@@ -928,6 +1051,8 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
                 bytes.len()
             );
 
+            shape = BodyShape::NotAnObject;
+
             Value::Object(Map::new())
         }
         Err(error) => {
@@ -940,21 +1065,36 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
                 redact_secrets(&flatten_error_detail(&error.to_string()))
             );
 
+            shape = BodyShape::NotJson;
+
             Value::Object(Map::new())
         }
     };
 
     // (4) Routing. The key is `body.model` matched against the row id with NO discoverability
     // filter: a hidden row stays routable, which is what makes `enabled` a catalog switch and not a
-    // routing switch (`crate::registry::Registry::find`).
-    let Some(client) = document
-        .get("model")
-        .and_then(Value::as_str)
-        .and_then(|key| registry.find(key))
-    else {
+    // routing switch (`crate::registry::Registry::find`). TWO 404s live here and they are kept apart
+    // on purpose, because they name two different faults:
+    //   * the body DID name a model string and no row owns it -> the deployed
+    //     `Model '<id>' not found` verbatim. That message IS the reason, and the id in it is real.
+    //   * the body named no usable `model` at all -> deviation 5: the field is absent, or is present
+    //     but not a string (a number, `null`, an object), or the body was folded into the empty
+    //     document because it was not JSON. The deployed relay prints the JS artefact
+    //     `Model 'undefined' not found` here; it names no model and explains nothing, so the body
+    //     names the FIELD instead and the `warn!` records what did arrive. No separate branch is
+    //     needed for "absent" vs "present but not a string": `model` is either in the key list that
+    //     line prints or it is not, which IS the distinction, and guessing it from the shape alone
+    //     would be the invented key list the no-content rule forbids.
+    let Some(requested) = document.get("model").and_then(Value::as_str) else {
+        warn_missing_model_field(endpoint, shape, &document, bytes.len());
+
+        return error(StatusCode::NOT_FOUND, MISSING_MODEL_FIELD_MESSAGE);
+    };
+
+    let Some(client) = registry.find(requested) else {
         return error(
             StatusCode::NOT_FOUND,
-            format!("Model '{}' not found", model_label(&document)),
+            format!("Model '{requested}' not found"),
         );
     };
 
@@ -969,6 +1109,12 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
     // The attribution is read NOW: the response head has arrived, which is the only instant that can
     // name the relay this request used.
     let log = RequestLog::capture(client);
+
+    // The one extra line per request the operator asked for: it names the row and the relay while the
+    // request is still in flight, so a stream that hangs is attributable before it settles. Both
+    // response shapes get it, and at the default `info` level nothing else here is added per request
+    // (the flight lines are `debug!`, and the token line still carries the settlement).
+    log.announce(endpoint);
 
     match answer {
         ResponseOrStream::Response(completion) => {
@@ -1393,32 +1539,122 @@ pub fn group_thousands(value: u64) -> String {
     grouped
 }
 
-/// The `<model>` half of the 404 message, following JS template interpolation.
+/// What the request body ACTUALLY was, as the parse step found it (deviation 5).
 ///
-/// The TypeScript interpolates whatever `body.model` was, so an absent key prints `undefined` and a
-/// non-string prints its `String()` form. Objects and arrays are the two values whose JS spelling is
-/// not a literal transcription: an object stringifies to `[object Object]` and an array joins its
-/// members, which is what the two arms below do.
+/// Why a type rather than a string: the three arms below are the only answers gate (4) can honestly
+/// give about a body that named no model, and the distinction is the diagnostic - "keys: messages,
+/// max_tokens" and "the body was not parseable JSON" point at two different broken clients, while an
+/// invented `keys:` list for a body that had no keys at all would point at a fault that is not there.
+/// `Value::Null` never reaches this type: that arm answers 500 and returns before the gate
+/// ([`completion`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyShape {
+    /// Valid JSON object: its top-level key names are the diagnostic.
+    Object,
+    /// Valid JSON that is not an object - `[1,2]`, `7`, `"text"`. Parseable, but it has no keys.
+    NotAnObject,
+    /// Not JSON at all - `""`, `not json`, truncated bytes. Nothing may be claimed about its keys.
+    NotJson,
+}
+
+/// One `warn!` for the missing-`model` 404, naming only what an operator needs and nothing private.
+///
+/// WHY THIS LINE EXISTS AT ALL: the 404 body now says the FIELD was wrong (
+/// [`MISSING_MODEL_FIELD_MESSAGE`]), which is the right thing to tell a CALLER but leaves the operator
+/// with two indistinguishable faults - a client that sent `{}` and a client whose body never parsed.
+/// The route name plus the key names tells them apart, which is the whole reason the fault was
+/// misdiagnosed in production the first time.
+///
+/// HARD CONSTRAINT - NAMES, NEVER CONTENT. Only three things are ever printed: the route token
+/// ([`CHAT_COMPLETIONS_ENDPOINT`] / [`RESPONSES_ENDPOINT`]), the byte COUNT, and the top-level KEY
+/// NAMES of the JSON object. No message text, no tool payload, no header or credential VALUE: a
+/// chat body is user content and this route serves requests that may not even be authorised. Key
+/// names are user-supplied bytes, so the joined list goes through [`flatten_error_detail`] - the
+/// crate's whitespace flattener, secret redactor and 200-character cap in one call - which also stops
+/// a key named `"a\ninfo: forged"` from writing a second log line.
+///
+/// WHY `warn` AND NOT `info`: this is a request the gateway refused for a reason the sender has to
+/// fix, and at the crate's default `info` level the operator asked for one line per SUCCESSFUL request
+/// only - a fault that explains itself still has to be visible.
+fn warn_missing_model_field(endpoint: &str, shape: BodyShape, body: &Value, bytes: usize) {
+    // Each shape gets the honest sentence for itself; two of them deliberately claim NOTHING about
+    // keys, which is the point of tracking the parse outcome separately from the folded document.
+    let what = match shape {
+        BodyShape::NotJson => format!("the body is not parseable JSON ({bytes} bytes)"),
+        BodyShape::NotAnObject => format!("the body is JSON but not an object ({bytes} bytes)"),
+        BodyShape::Object => describe_top_level_keys(body, bytes),
+    };
+
+    tracing::warn!(
+        target: "typecrate_provider::serve",
+        "{endpoint}: refused 404, the body named no usable `model` field; {what}"
+    );
+}
+
+/// The `{n} bytes, keys[...]` half of [`warn_missing_model_field`]'s line.
+///
+/// Every key is FREE OF NON-WHITESPACE CONTROL CHARACTERS before it is printed (see the strip below),
+/// because the body is untrusted input and the line goes to a terminal; the cap, the whitespace
+/// flattening and the redaction come from [`flatten_error_detail`].
+///
+/// The sort is what makes the line reproducible: `serde_json` preserves INSERTION order by default
+/// (the `preserve_order` feature is what the crate's own frame-key assertions rely on), so an
+/// unsorted list would put a different key first for every client and defeat a grep.
 #[must_use]
-pub fn model_label(body: &Value) -> String {
-    match body.get("model") {
-        // `${undefined}` - the key is absent.
-        None => "undefined".to_owned(),
-        Some(Value::Null) => "null".to_owned(),
-        Some(Value::String(value)) => value.clone(),
-        // `String(5)` is `5` and `String(true)` is `true`; serde_json writes both the same way.
-        Some(value @ (Value::Number(_) | Value::Bool(_))) => value.to_string(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|item| match item {
-                // Array members go through JS's own element coercion when joined.
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-        Some(Value::Object(_)) => "[object Object]".to_owned(),
+fn describe_top_level_keys(body: &Value, bytes: usize) -> String {
+    let Some(entries) = body.as_object() else {
+        // Unreachable today - `BodyShape::Object` is only set from an `is_object()` arm - and it
+        // still degrades to a byte count rather than an `unwrap`.
+        return format!("the body is not a JSON object ({bytes} bytes)");
+    };
+
+    // A JSON key is arbitrary text, and `flatten_error_detail` (below) only collapses whitespace, caps
+    // the length and redacts secrets - it does NOT touch control characters. A caller can therefore
+    // send `"me\u{0}ssage"` or `"mo\u{1b}[31mdel"`, and the ESC would reach the terminal inside the
+    // printed list and recolour or erase the rest of the record (2026-11-24 review, N6). Every
+    // NON-WHITESPACE control character is dropped here, before the list is joined: Unicode `Cc` minus
+    // the whitespace the parity rule already handles. WHITESPACE IS DELIBERATELY LEFT ALONE, because
+    // `flatten_error_detail` collapsing `\n`/`\t`/`\r` into a single space is the deployed gateway's
+    // behaviour (`start.ts` flattens `\s`) and it is pinned above by the newline-in-a-key assertion -
+    // stripping the newline instead would print `zzinfo` where the gateway prints `zz info`.
+    // DROPPING rather than substituting a marker is deliberate: the terminal is what is being protected
+    // (an ESC is what turns `[31m` into a colour), and the printable remainder stays in the line as the
+    // literal garbage it is, so the operator still sees that the caller sent a strange key. Two keys
+    // that differ only in control characters collapse to the same printed name, which the count beside
+    // the list still reports.
+    let mut names: Vec<String> = entries
+        .keys()
+        .map(|key| {
+            key.chars()
+                .filter(|character| !character.is_control() || character.is_whitespace())
+                .collect()
+        })
+        .collect();
+    names.sort();
+
+    let shown = names.len().min(MISSING_MODEL_KEYS_SHOWN);
+    // `flatten_error_detail` is the log-injection guard and the length cap described on
+    // [`warn_missing_model_field`]; it runs on the JOINED list so one pathological key cannot push
+    // the rest out of the record on its own.
+    let listed = flatten_error_detail(&names[..shown].join(", "));
+
+    // A body of `{}` has no names to blame, and saying `keys[]=` would read like a formatting bug.
+    if names.is_empty() {
+        return format!("{bytes} bytes, a JSON object with no keys at all");
     }
+
+    // The remainder is counted, never invented: an operator reading a capped line has to be able to
+    // tell it from a complete one.
+    let hidden = names.len() - shown;
+    let tail = if hidden == 0 {
+        String::new()
+    } else {
+        // The list is capped at [`MISSING_MODEL_KEYS_SHOWN`], so `hidden` is the count BEYOND that
+        // cap and the total is always `shown + hidden`.
+        format!(" (+{hidden} more of {})", names.len())
+    };
+
+    format!("{bytes} bytes, {shown} top-level key(s): {listed}{tail}")
 }
 
 /// One query value, read the way Hono's `req.query()` reads it: the FIRST value for a repeated key,
@@ -1516,11 +1752,12 @@ fn upstream_throw(endpoint: &str, failure: &TransportFailure) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        DEFAULT_VAULT_ARTIFACT, REGENERATION_COMMAND, Unavailable, VaultSource, format_token_line,
-        group_thousands, model_label, query_value, to_fixed_two, vault_source_from_values,
+        DEFAULT_VAULT_ARTIFACT, MISSING_MODEL_FIELD_MESSAGE, MISSING_MODEL_KEYS_SHOWN,
+        REGENERATION_COMMAND, Unavailable, VaultSource, describe_top_level_keys, format_token_line,
+        group_thousands, query_value, to_fixed_two, vault_source_from_values,
     };
 
     #[test]
@@ -1586,18 +1823,92 @@ mod tests {
         assert_eq!(to_fixed_two(f64::INFINITY), "inf");
     }
 
+    /// The operator line for a body that named no model. The JS interpolation this test used to pin
+    /// (`model_label` -> `Model 'undefined' not found`) is GONE on purpose, 2026-11-24: `undefined`
+    /// was a rendering artefact of the deployed TypeScript's template literal, not a model id, and it
+    /// told the reader nothing. See deviation 5 in this module's header and
+    /// [`MISSING_MODEL_FIELD_MESSAGE`].
     #[test]
-    fn the_model_label_follows_js_interpolation_for_every_body_shape() {
-        assert_eq!(model_label(&json!({})), "undefined");
-        assert_eq!(model_label(&json!({ "model": null })), "null");
+    fn the_missing_model_sentence_is_pinned_as_data() {
         assert_eq!(
-            model_label(&json!({ "model": "local/strata" })),
-            "local/strata"
+            MISSING_MODEL_FIELD_MESSAGE,
+            "Model field is required and was missing or not a string in the request body",
+            "the wire sentence, byte for byte; a rewording here is a wire change"
         );
-        assert_eq!(model_label(&json!({ "model": 5 })), "5");
-        assert_eq!(model_label(&json!({ "model": true })), "true");
-        assert_eq!(model_label(&json!({ "model": {} })), "[object Object]");
-        assert_eq!(model_label(&json!({ "model": ["a", 1] })), "a,1");
+    }
+
+    /// The key list is the whole diagnostic, so its ORDER, its CAP and its remainder count are all
+    /// contract. `serde_json` preserves insertion order (the `preserve_order` feature), so an
+    /// unsorted list would name a different key first for every client and defeat a grep.
+    #[test]
+    fn the_body_key_descriptive_names_the_count_the_sorted_names_and_the_remainder() {
+        // Insertion order is the reverse of the sort, so the expectation proves the sort ran.
+        assert_eq!(
+            describe_top_level_keys(
+                &json!({ "zz_stream": false, "zz_messages": [], "zz_model_like": 7 }),
+                27
+            ),
+            "27 bytes, 3 top-level key(s): zz_messages, zz_model_like, zz_stream"
+        );
+
+        // The one shape with nothing to name: saying `keys[]=` would read like a formatting bug.
+        assert_eq!(
+            describe_top_level_keys(&json!({}), 2),
+            "2 bytes, a JSON object with no keys at all"
+        );
+
+        // The defensive arm. `BodyShape::Object` is only ever set from an `is_object()` guard, so a
+        // non-object reaching here means a future caller forgot the guard - and it still degrades to
+        // a sentence rather than an `unwrap`.
+        assert_eq!(
+            describe_top_level_keys(&json!(7), 1),
+            "the body is not a JSON object (1 bytes)"
+        );
+
+        // The cap, as data: 19 keys named `k00`..`k18`, of which `MISSING_MODEL_KEYS_SHOWN` (16) are
+        // listed in sort order and the remaining 3 are counted, not invented.
+        let mut wide = serde_json::Map::new();
+        for index in 0..19 {
+            wide.insert(format!("k{index:02}"), Value::Bool(true));
+        }
+        let listed: Vec<String> = (0..16).map(|index| format!("k{index:02}")).collect();
+
+        assert_eq!(
+            describe_top_level_keys(&Value::Object(wide), 88),
+            format!(
+                "88 bytes, {} top-level key(s): {} (+3 more of 19)",
+                MISSING_MODEL_KEYS_SHOWN,
+                listed.join(", ")
+            )
+        );
+
+        // A key NAME is caller bytes. A newline in one must not forge a second log line, and
+        // `flatten_error_detail` is what flattens it (the same call also redacts and caps).
+        let mut injected = serde_json::Map::new();
+        injected.insert("zz\ninfo: forged".to_owned(), Value::Bool(true));
+        injected.insert("zz_probe".to_owned(), Value::Bool(true));
+
+        assert_eq!(
+            describe_top_level_keys(&Value::Object(injected), 9),
+            "9 bytes, 2 top-level key(s): zz info: forged, zz_probe"
+        );
+
+        // The HALF `flatten_error_detail` cannot cover: it collapses whitespace, caps the length and
+        // redacts credential shapes, but a NUL or an ESC is neither whitespace nor a secret, and an ESC
+        // reaching a terminal rewrites the rest of the record. Non-whitespace control characters are
+        // therefore stripped per key, so the NUL vanishes and the ANSI escape loses the byte that made
+        // it an escape — its printable remainder stays visible as the garbage it is (`mo[31mdel`), and
+        // nothing can recolour the line. The exact string below IS the assertion: a surviving
+        // `\u{1b}[31m` or a surviving `\u{0}` fails it. The newline case above keeps the flattened
+        // form, because that half IS the gateway's rule.
+        let mut hostile = serde_json::Map::new();
+        hostile.insert("me\u{0}ssage".to_owned(), Value::Bool(true));
+        hostile.insert("mo\u{1b}[31mdel".to_owned(), Value::Bool(true));
+
+        assert_eq!(
+            describe_top_level_keys(&Value::Object(hostile), 24),
+            "24 bytes, 2 top-level key(s): message, mo[31mdel"
+        );
     }
 
     #[test]

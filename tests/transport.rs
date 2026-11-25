@@ -34,7 +34,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Barrier, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::Poll,
@@ -1175,8 +1175,15 @@ async fn a_cancelled_request_reports_the_abort_constant() {
 // Rotation and the resume ledger
 // ---------------------------------------------------------------------------
 
-/// Rotation is the typed `switchBaseUrl()`: forward-only over the pool, and on exhaustion the LAST
+/// Rotation, through the documented SEAM, is forward-only over the pool, and on exhaustion the LAST
 /// entry stays in force - `local-strata.ts:244-250` returns false WITHOUT clearing `baseURL`.
+///
+/// What changed with the concurrency fix is what the endpoint cursor MEANS: it is a verified-prefix
+/// head, so `rotate_endpoint` publishes past the entry the head itself names rather than claiming a
+/// slot per caller (`src/transport.rs::Transport::rotate_endpoint` explains why production rotation no
+/// longer runs through it). The observable walk of a SINGLE caller is identical, which is what the
+/// assertions below pin - and the head is now asserted alongside the selection, because "one step per
+/// call" is the property the old claim-a-slot cursor could not promise under load.
 #[tokio::test]
 async fn rotation_walks_the_pools_and_then_reports_exhaustion() {
     let target = Target::new(
@@ -1206,6 +1213,11 @@ async fn rotation_walks_the_pools_and_then_reports_exhaustion() {
         Some("https://two.example/v1".to_owned())
     );
     assert_eq!(transport.endpoint_index(), Some(1));
+    assert_eq!(
+        transport.endpoint_head(),
+        1,
+        "one seam step publishes exactly one entry as verified"
+    );
     assert!(!transport.endpoints_exhausted());
 
     assert_eq!(
@@ -1214,10 +1226,16 @@ async fn rotation_walks_the_pools_and_then_reports_exhaustion() {
             .map(|endpoint| endpoint.base_url().to_owned()),
         Some("https://three.example/v1".to_owned())
     );
+    assert_eq!(transport.endpoint_head(), 2);
     assert!(transport.endpoints_exhausted());
 
     // Exhaustion: no endpoint left, and the cursor STAYS on the last one.
     assert_eq!(transport.rotate_endpoint(), None);
+    assert_eq!(
+        transport.endpoint_head(),
+        2,
+        "a refused rotation publishes nothing: there was no entry to verify"
+    );
     assert_eq!(
         transport
             .current_endpoint()
@@ -1243,16 +1261,259 @@ async fn rotation_walks_the_pools_and_then_reports_exhaustion() {
 
     transport.reset_rotation();
     assert_eq!(transport.endpoint_index(), Some(0));
+    assert_eq!(
+        transport.endpoint_head(),
+        0,
+        "the seam rewinds the head as well"
+    );
     assert_eq!(transport.credential_index(), Some(0));
 
-    // The pool is shared by clone: a cloned transport is the same singleton, which is how the
+    // The HEAD is shared by clone: a cloned transport is the same singleton, which is how the
     // TypeScript clients behave (process-wide, one credential/base-URL pair that mutates in place).
+    // What a clone does NOT share is a walk position - no such state exists on the transport - so two
+    // clones starting at the same head dial the same entry, which is the lockstep the contract chose
+    // over per-caller slot claiming.
     let clone = transport.clone();
     assert!(clone.rotate_endpoint().is_some());
     assert_eq!(
         transport.endpoint_index(),
         Some(1),
         "the cursors are shared, not copied"
+    );
+    assert_eq!(
+        transport.endpoint_head(),
+        1,
+        "and the clone's publish is visible through the original, because it is the same head"
+    );
+}
+
+/// A transport over `relays`, one labelled endpoint per name, so the captured request path proves
+/// which relay an attempt reached. The pool shape `build_transport` does not give: one listener,
+/// several NAMED bases.
+fn pool_transport(
+    address: &str,
+    relays: &[&str],
+    credential: TestCredential,
+    pause: Duration,
+) -> Transport {
+    let endpoints = relays
+        .iter()
+        .map(|relay| Endpoint::labeled(&format!("http://{address}/{relay}"), relay))
+        .collect();
+
+    Transport::with_http_client(
+        Target::new(endpoints, vec![credential.build()]),
+        Policy::standard().with_rate_limit_pause(pause),
+        client(),
+    )
+}
+
+/// THE PIN: a caller that names the endpoint it wants dials THAT endpoint, and the shared selection
+/// neither moves nor gets consulted.
+///
+/// This is the transport half of the per-request walk (`src/transport.rs::RequestOptions::endpoint`):
+/// the transport must not re-read shared state to pick a dial target while a request is in flight. The
+/// contrast is asserted in one test - pinned call dials the third relay, unpinned call dials the pool
+/// head - and both leave the head exactly where they found it, because only a 404 the CALLER collected
+/// is allowed to publish.
+#[tokio::test]
+async fn a_pinned_request_dials_the_pin_and_never_the_shared_selection() {
+    let address = provider(vec![
+        Reply::Json(StatusCode::OK, json!({ "id": "cmpl-pinned" })),
+        Reply::Json(StatusCode::OK, json!({ "id": "cmpl-head" })),
+    ])
+    .await;
+
+    let transport = pool_transport(
+        &address,
+        &["relay-one", "relay-two", "relay-three"],
+        TestCredential::Keyed,
+        Duration::from_millis(5),
+    );
+
+    let pinned = transport
+        .endpoint_at(2)
+        .expect("the third relay of the pool exists");
+
+    transport
+        .post(
+            CHAT_COMPLETIONS_PATH,
+            &json!({ "model": "m", "messages": [] }),
+            RequestOptions::new().with_endpoint(pinned),
+        )
+        .await
+        .expect("the pinned relay answers");
+
+    let seen = ledger(&address).seen();
+
+    assert_eq!(
+        seen[0].path, "/relay-three/v1/chat/completions",
+        "the PIN decided the dial target, not the shared selection sitting on relay-one"
+    );
+    assert_eq!(
+        transport.endpoint_index(),
+        Some(0),
+        "and dialling a pinned entry advanced nothing"
+    );
+    assert_eq!(
+        transport.endpoint_head(),
+        0,
+        "a success publishes nothing, pinned or otherwise"
+    );
+
+    // The same transport, unpinned: model discovery and the direct-driving suites keep the fallback,
+    // which is the shared selection as it stands when the CALL starts.
+    transport
+        .post(
+            CHAT_COMPLETIONS_PATH,
+            &json!({ "model": "m", "messages": [] }),
+            RequestOptions::new(),
+        )
+        .await
+        .expect("the pool head answers");
+
+    assert_eq!(
+        ledger(&address).seen()[1].path,
+        "/relay-one/v1/chat/completions",
+        "an unpinned call dials the selection"
+    );
+}
+
+/// An INTERNAL retry stays on the pinned endpoint.
+///
+/// The transport retries 429s, timeouts and dead sockets by itself, and a retry that silently moved to
+/// another upstream would break the client layer's per-request walk: the client logs and publishes
+/// against the endpoint IT pinned, so every attempt of one `post` call has to hit that same entry. The
+/// scripted 429 then 200 pair below is the cheapest way to make two attempts happen inside one call.
+#[tokio::test]
+async fn a_pinned_retry_stays_on_the_pinned_endpoint() {
+    let address = provider(vec![
+        Reply::Json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "error": { "message": "slow down" } }),
+        ),
+        Reply::Json(StatusCode::OK, json!({ "id": "cmpl-after-pause" })),
+    ])
+    .await;
+
+    // A zero pause: the retry is the behaviour under test, not the wait (`tests/transport.rs`'s own
+    // 429 test takes the same shortcut for the same reason).
+    let transport = pool_transport(
+        &address,
+        &["relay-one", "relay-two", "relay-three"],
+        TestCredential::Keyed,
+        Duration::ZERO,
+    );
+
+    let pinned = transport
+        .endpoint_at(2)
+        .expect("the third relay of the pool exists");
+
+    transport
+        .post(
+            CHAT_COMPLETIONS_PATH,
+            &json!({ "model": "m", "messages": [] }),
+            RequestOptions::new().with_endpoint(pinned),
+        )
+        .await
+        .expect("the retry succeeds on the same relay");
+
+    let attempts = ledger(&address).attempts();
+
+    assert_eq!(attempts, 2, "the 429 consumed one retry inside this call");
+    assert_eq!(
+        ledger(&address)
+            .seen()
+            .iter()
+            .map(|attempt| attempt.path.clone())
+            .collect::<Vec<String>>(),
+        vec![
+            "/relay-three/v1/chat/completions".to_owned(),
+            "/relay-three/v1/chat/completions".to_owned()
+        ],
+        "both attempts dialed the pinned relay: an internal retry never changes the upstream"
+    );
+    assert_eq!(
+        transport.endpoint_head(),
+        0,
+        "and the shared head is untouched by another request's retries"
+    );
+}
+
+/// Credential rotation raced from twenty threads: every racer is handed the credential IT claimed, no
+/// credential is handed out twice, and none is skipped.
+///
+/// The endpoint axis moved to a `fetch_max` head precisely because it does not hand out slots; the
+/// credential axis still does, because taking a key out of the pool takes it out for every caller
+/// (`nvidia-glm5-flash.ts:13-18`, `makora-glm-5-3.ts:6-11`). That is what makes the exactness of
+/// `advance` observable from outside the module, and the assertion is an exact multiset rather than a
+/// property: eight entries give seven claims, so twenty racers must produce those seven values once
+/// each plus thirteen exhaustion answers. The pre-fix `advance` returned a post-hoc `load`, so two
+/// racers could report the same later slot and the entry neither of them claimed went unserved.
+///
+/// The primitive-level version of this test is the inline unit in `src/transport.rs`
+/// (`transport::tests::advance_hands_each_racer_the_slot_it_claimed`), which lives there because
+/// `advance` itself is private.
+#[test]
+fn credential_rotation_hands_every_racer_the_credential_it_claimed() {
+    let pool: Vec<Credential> = (0..8)
+        .map(|index| Credential::new(&Secret::new(format!("sk-contention-key-{index:02}"))))
+        .collect();
+
+    let transport = Transport::with_policy(
+        Target::new(vec![Endpoint::new("https://one.example/v1")], pool.clone()),
+        Policy::standard(),
+    );
+
+    let racers = 20_usize;
+    let barrier = Barrier::new(racers);
+
+    let claims: Vec<Option<String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..racers)
+            .map(|_| {
+                let transport = transport.clone();
+                // A `Copy` reference into the scope, since twenty `move` closures cannot each take the
+                // `Barrier` itself.
+                let gate: &Barrier = &barrier;
+
+                scope.spawn(move || {
+                    gate.wait();
+
+                    transport
+                        .rotate_credential()
+                        .and_then(|credential| credential.expose().map(str::to_owned))
+                })
+            })
+            .collect();
+
+        // Spawned before joined, or the barrier never opens.
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the racing thread did not panic"))
+            .collect()
+    });
+
+    let mut served: Vec<String> = claims.iter().flatten().cloned().collect();
+    served.sort();
+
+    assert_eq!(
+        served,
+        (1..8)
+            .map(|index| format!("sk-contention-key-{index:02}"))
+            .collect::<Vec<String>>(),
+        "seven claims for seven slots: every credential handed out exactly once, and never the pool \
+         head, which is the entry the first rotation left behind"
+    );
+    assert_eq!(
+        claims.iter().filter(|claim| claim.is_none()).count(),
+        racers - 7,
+        "the racers beyond the last claim get the exhaustion answer, not a repeat of someone else's \
+         credential"
+    );
+    assert_eq!(
+        transport.credential_index(),
+        Some(7),
+        "and the cursor ends on the last entry, the documented exhaustion fallback"
     );
 }
 

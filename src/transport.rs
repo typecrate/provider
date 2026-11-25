@@ -20,23 +20,52 @@
 //! `inputTokenTotal`/`cacheTokenTotal`/`ttftMillisecondTotal` (the TS instance fields at
 //! `model-class.ts:411-457`) without this layer duplicating them.
 //!
-//! ONE SHARED, MUTABLE TARGET (`&self` everywhere)
-//! -----------------------------------------------
+//! ONE SHARED HEAD, ONE PINNED WALK PER REQUEST (`&self` everywhere)
+//! -----------------------------------------------------------------
 //! The TypeScript clients are process-wide singletons whose `baseURL` and `apiKey` FIELDS mutate
 //! in place (`model-class.ts:352-355` says `upstreamLabel` is "Mutable, NOT readonly";
 //! `local-strata.ts:253-257` assigns `this.baseURL` / `this.upstreamLabel` inside `switchBaseUrl`;
 //! `nvidia-glm5-flash.ts:81` assigns `this.apiKey`). The Rust equivalent has to rotate behind
 //! `&self`, because the routes will hold one transport per model and share it across requests. So
-//! the pools are immutable `Vec`s and the SELECTION is a pair of [`AtomicUsize`] cursors that only
-//! ever move forward, shared through an [`Arc`] on `Clone` - a clone of a transport is the SAME
+//! the pools are immutable `Vec`s and the SELECTION is a pair of [`AtomicUsize`]s that only ever
+//! move forward, shared through an [`Arc`] on `Clone` - a clone of a transport is the SAME
 //! singleton, not a second queue.
+//!
+//! THE TWO AXES ARE NOT THE SAME KIND OF STATE, AND THE DIFFERENCE IS THE CONCURRENCY FIX.
+//!   * The ENDPOINT cursor is a VERIFIED-PREFIX HEAD, not a claim slot. `head == j` states one
+//!     fact about the pool: some request has PERSONALLY dialled `pool[j]` and received its verdict,
+//!     and that verdict was the failover trigger (HTTP 404). The dial IS the probe - this port has no
+//!     pre-flight health check to invent, so "verified" means exactly "someone got the real answer".
+//!     Each request keeps its OWN position: it resolves `start = min(head, last)` once
+//!     ([`Transport::endpoint_start`]), then dials `pool[start]`, `pool[start + 1]`, ... and pins the
+//!     entry it dials for the whole [`Transport::post`] call, so none of its internal retries (the
+//!     429 pause, a timeout, a dead socket) can change the upstream under it. Only a 404 that THIS
+//!     request collected moves the head, and it moves it with `fetch_max`
+//!     ([`Transport::verify_endpoint`]).
+//!   * The CREDENTIAL cursor stays a claim-a-slot cursor, advanced by [`advance`]: the credential
+//!     families hand the NEXT caller a key that has been taken out of the pool
+//!     (`nvidia-glm5-flash.ts:13-18`, `makora-glm-5-3.ts:6-11`), which IS a per-rotation claim
+//!     rather than a verification.
+//!
+//! Why the head is `fetch_max` and the old endpoint cursor was a compare-and-swap: a CAS-advance
+//! hands each of N concurrent 404s its OWN step, so ten requests failing on the same dead relay
+//! move the shared selection ten places and nine of them dial endpoints nobody had proved dead.
+//! `fetch_max` is idempotent and commutative, so N requests that all 404 at `pool[j]` publish the
+//! same head (`j + 1`), and the endpoints between them are dialled by every one of them. The cost is
+//! stated plainly: concurrent requests WALK IN LOCKSTEP and dial the same endpoints instead of
+//! spreading across the pool - deliberate, because spreading is precisely what used to skip
+//! unverified endpoints. The invariant that buys is [`Transport::verify_endpoint`]'s: for every
+//! `j < head`, `pool[j]` was personally 404-verified by some request, and every request's dial
+//! sequence is contiguous.
 //!
 //! Why a forward-only cursor rather than a drained `VecDeque`: the TypeScript `shift()` consumes
 //! the queue, so a rotated-past endpoint is never retried again in the process, and a cursor
 //! reproduces exactly that. Keeping the pool intact is what lets the ledger, `/stats` and
 //! [`Transport::reset_rotation`] still name every entry. On exhaustion the selection FALLS BACK to
 //! the LAST entry rather than to "nothing", because `local-strata.ts:244-250` returns false WITHOUT
-//! clearing `baseURL`: the endpoint that was set last stays in force.
+//! clearing `baseURL`: the endpoint that was set last stays in force. A fully-outaged pool therefore
+//! leaves the head one PAST `last` (every entry has been proved dead), and every read clamps to
+//! `last` - [`Self::selected_index`] is the single place that clamp lives.
 //!
 //! THE FOUR DECISIONS THE BRIEF ASKED FOR
 //! ---------------------------------------
@@ -54,13 +83,14 @@
 //!
 //! 2. 404 IS NOT RETRIED HERE. It is a typed outcome the caller acts on:
 //!    [`TransportError::Status`] with `status == 404` plus the [`Attempt`] ledger is exactly what
-//!    TS hands the route loop (`private-responses.ts:106-121`), and the caller then rotates
-//!    ([`Transport::rotate_endpoint`] / [`Transport::rotate_credential`]) and re-runs the WHOLE
-//!    attempt with the previous [`AttemptState`] handed back in through
+//!    TS hands the route loop (`private-responses.ts:106-121`), and the caller then moves to the entry
+//!    its OWN walk is on (`crate::client::ModelClient::dispatch` publishes the verification with
+//!    [`Transport::verify_endpoint`] and re-pins the next entry) and re-runs the WHOLE attempt with
+//!    the previous [`AttemptState`] handed back in through
 //!    [`RequestOptions::with_resume`] - the "the whole attempt is re-run" property of the TS fetch
 //!    wrapper (`model-class.ts:592-618`). `rebaseRequestInput` (`model-class.ts:141-164`) has no
-//!    Rust counterpart because the retry rebuilds its URL from the rotated endpoint instead of
-//!    string-patching the URL the previous attempt used.
+//!    Rust counterpart because the retry rebuilds its URL from the endpoint the request PINNED instead
+//!    of string-patching the URL the previous attempt used.
 //!
 //! 3. THE RETRY BUDGET IS BOUNDED. The exact TypeScript rule, verified line by line: the fetch
 //!    wrapper is `while (true)` (`model-class.ts:593-618`), and it retries ONLY when a status
@@ -1019,8 +1049,8 @@ pub enum StreamOutcome {
 /// `Arc`/`Copy` accounting state, so the stronger bound costs nothing at the call sites.
 pub type SettlementHook = Box<dyn FnOnce(StreamSettlement) + Send + Sync>;
 
-/// Per-call options: the cancellation signal, extra headers, the settlement hook, and the state a
-/// resumed attempt carries.
+/// Per-call options: the cancellation signal, extra headers, the settlement hook, the endpoint this
+/// call is pinned to, and the state a resumed attempt carries.
 #[derive(Default)]
 pub struct RequestOptions {
     /// Extra headers. A custom header REPLACES the generated one of the same name, which is why the
@@ -1036,12 +1066,22 @@ pub struct RequestOptions {
     pub on_settle: Option<SettlementHook>,
     /// The ledger a rotated re-run resumes from - [`TransportFailure::state`], handed back.
     pub resume: Option<AttemptState>,
+    /// The endpoint THIS call must dial, pinned by the caller.
+    ///
+    /// `crate::client` sets it once per attempt from the request's own walk position, and
+    /// [`Transport::run`] reads it exactly once per call: the pin holds across every internal retry,
+    /// so a 429 pause or a socket retry cannot silently move the request to a different upstream.
+    /// `None` is the unpinned shape - model discovery (`get_json`), and any suite that drives the
+    /// transport directly - which dials the shared selection as it stands when the CALL starts and
+    /// keeps dialling that same entry for every retry of that call.
+    pub endpoint: Option<Endpoint>,
 }
 
 impl std::fmt::Debug for RequestOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The hook is a boxed closure with nothing useful to print; naming its presence is all a
-        // diagnostic needs. Nothing in this type can hold a credential anyway.
+        // diagnostic needs. Nothing in this type can hold a credential anyway: an `Endpoint` is a
+        // normalised URL plus a public relay NAME, both of which the log lines already print.
         formatter
             .debug_struct("RequestOptions")
             .field("headers", &self.headers)
@@ -1051,6 +1091,7 @@ impl std::fmt::Debug for RequestOptions {
                 &self.on_settle.as_ref().map(|_| "SettlementHook"),
             )
             .field("resume", &self.resume)
+            .field("endpoint", &self.endpoint)
             .finish()
     }
 }
@@ -1093,6 +1134,19 @@ impl RequestOptions {
 
         self
     }
+
+    /// Pins this call to one endpoint, for every attempt it makes.
+    ///
+    /// This is how a request keeps its upstream to itself: the transport reads the pin once and
+    /// never re-reads the shared selection while the call is in flight, so the caller's walk position
+    /// (not whatever another concurrent request published) decides what gets dialled
+    /// (see the module section "ONE SHARED HEAD, ONE PINNED WALK PER REQUEST").
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.endpoint = Some(endpoint);
+
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,14 +1159,25 @@ impl RequestOptions {
 /// `Clone` shares the rotation cursors through an `Arc`, so a cloned transport is the SAME singleton
 /// - which is how the TypeScript clients behave: process-wide, one credential/base-URL pair that
 ///   mutates in place for every request the process makes.
+///
+/// What is shared is deliberately NARROW on the endpoint axis: a clone shares only the
+/// verified-prefix HEAD (`endpoint_head`), i.e. the bookkeeping of which entries some request has
+/// PERSONALLY dialled and received the failover verdict from. Where a request IS in its own walk is
+/// per-request state, never shared, and every dial is pinned to the entry the walker chose. That is
+/// the property that stops a burst of concurrent requests from skipping endpoints no one ever
+/// dialled; `rotate_endpoint` and `reset_rotation` are the documented seams that still move the
+/// shared head outside a request's own walk.
 #[derive(Clone, Debug)]
 pub struct Transport {
     http: Client,
     policy: Policy,
     target: Target,
-    /// The endpoint selection cursor - the in-place `baseURL` mutation of the TypeScript original.
-    endpoint_cursor: Arc<AtomicUsize>,
-    /// The credential selection cursor - the in-place `apiKey` mutation.
+    /// The endpoint VERIFIED-PREFIX head - the in-place `baseURL` mutation of the TypeScript
+    /// original, weakened from "the selection every request dials" to "which entries have been
+    /// proved dead, by someone, on purpose".
+    endpoint_head: Arc<AtomicUsize>,
+    /// The credential selection cursor - the in-place `apiKey` mutation. This one IS a shared
+    /// claim-a-slot cursor, because taking a credential out of the pool takes it out for everyone.
     credential_cursor: Arc<AtomicUsize>,
 }
 
@@ -1137,7 +1202,7 @@ impl Transport {
             http,
             policy,
             target,
-            endpoint_cursor: Arc::new(AtomicUsize::new(0)),
+            endpoint_head: Arc::new(AtomicUsize::new(0)),
             credential_cursor: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -1157,7 +1222,7 @@ impl Transport {
     /// The endpoint currently selected; `None` only when the pool is empty.
     #[must_use]
     pub fn current_endpoint(&self) -> Option<Endpoint> {
-        Self::selected(&self.endpoint_cursor, &self.target.endpoints)
+        Self::selected(&self.endpoint_head, &self.target.endpoints)
     }
 
     /// The credential currently selected; `None` when the pool is empty.
@@ -1170,7 +1235,7 @@ impl Transport {
     /// the ledger and `/stats` both name entries by position as well as by label.
     #[must_use]
     pub fn endpoint_index(&self) -> Option<usize> {
-        Self::selected_index(&self.endpoint_cursor, &self.target.endpoints)
+        Self::selected_index(&self.endpoint_head, &self.target.endpoints)
     }
 
     /// The index currently selected in the credential pool.
@@ -1179,30 +1244,137 @@ impl Transport {
         Self::selected_index(&self.credential_cursor, &self.target.credentials)
     }
 
+    /// The endpoint pool's entry at one index, `None` outside the pool.
+    ///
+    /// This is what a per-request walk pins from: the pools are immutable, so the entry at an index
+    /// IS that index, and a caller that holds the value never has to touch the shared head again to
+    /// dial it.
+    #[must_use]
+    pub fn endpoint_at(&self, index: usize) -> Option<Endpoint> {
+        self.target.endpoints.get(index).cloned()
+    }
+
+    /// The endpoint pool's last valid index, `None` for an empty pool.
+    #[must_use]
+    pub fn endpoint_last_index(&self) -> Option<usize> {
+        self.target.endpoints.len().checked_sub(1)
+    }
+
+    /// The raw verified-prefix head, which may legitimately sit ONE PAST the last index - that is
+    /// what a fully-outaged pool looks like: every entry dialled, every entry 404ed.
+    ///
+    /// Every SELECTION reads it clamped (see [`Self::endpoint_index`] and [`Self::endpoint_start`]);
+    /// this raw form exists for the walk arithmetic and for the suites that assert the head landed on
+    /// the index the contract says it must.
+    #[must_use]
+    pub fn endpoint_head(&self) -> usize {
+        self.endpoint_head.load(Ordering::SeqCst)
+    }
+
+    /// Where a NEW request's walk starts: the head, clamped into the pool. `None` for an empty pool,
+    /// which is the "target has no endpoint" case the caller still has to answer.
+    ///
+    /// A request resolves this ONCE, at dispatch start, and from then on its own arithmetic owns its
+    /// position. Re-reading it per attempt is exactly the race this type no longer has: a shared
+    /// re-read hands a request whatever the last concurrent failure selected.
+    #[must_use]
+    pub fn endpoint_start(&self) -> Option<usize> {
+        Self::selected_index(&self.endpoint_head, &self.target.endpoints)
+    }
+
+    /// Records that the CALLER personally dialled `pool[position]` and received the failover verdict
+    /// from it, publishing `head := max(head, position + 1)`.
+    ///
+    /// What it RETURNS is `max(head_before_this_fetch_max, position + 1)`: the highest value this call
+    /// could have produced, which is a LOWER BOUND on the head immediately after it - a concurrent
+    /// publish of a later entry may land between the `fetch_max` and any later read, so the caller must
+    /// not treat the return value as "the head as of this call". Nothing in the crate needs the exact
+    /// post-publish head; only the published value matters.
+    ///
+    /// `fetch_max` is the whole point: the publish is idempotent and commutative, so a hundred
+    /// concurrent requests that all 404 at the same entry agree on ONE head, where the previous
+    /// claim-a-slot cursor advanced a hundred times and every step after the first skipped an
+    /// endpoint nobody had dialled. It never rewinds and never wraps, so the INVARIANT holds for the
+    /// life of the process:
+    ///   * for every `j < head`, `pool[j]` was personally 404-verified by SOME request;
+    ///   * each request's own dial sequence is contiguous, because a request moves from `position` to
+    ///     `position + 1` only after collecting that position's verdict.
+    ///
+    /// Those two statements together are the guarantee the user asked for: no endpoint is skipped
+    /// unverified, no matter how many requests arrive at once. The cost is stated plainly - concurrent
+    /// requests walk in lockstep and dial the same entries instead of spreading across the pool - and
+    /// spreading is exactly what used to skip.
+    #[must_use]
+    pub fn verify_endpoint(&self, position: usize) -> usize {
+        // `fetch_max` returns the value BEFORE this call, so the new head is `max(old, position + 1)`;
+        // re-loading afterwards would race with a concurrent publish and report someone else's number.
+        self.endpoint_head
+            .fetch_max(position + 1, Ordering::SeqCst)
+            .max(position + 1)
+    }
+
     /// The relay NAME in force right now. `upstreamLabel` parity includes its CAPTURE RULE: read it
     /// at the response head, not after the stream drains, because the shared client may rotate in
     /// between (`private-chat-completion.ts:106-122`).
+    ///
+    /// What it cannot promise is the second half of that rule under concurrency: this is a read of the
+    /// SHARED head, so it names the entry the process sits on, which is the entry a request dialled
+    /// only when that request is the only one running. A request's own attribution comes from the
+    /// endpoint IT pinned (`crate::client::ServedEndpoint`), never from a re-read like this one.
     #[must_use]
     pub fn upstream_label(&self) -> Option<String> {
         self.current_endpoint().and_then(|endpoint| endpoint.label)
     }
 
-    /// Advances to the next endpoint - `switchBaseUrl()` for the endpoint-rotating clients
-    /// (`local-strata.ts:243-261`). `None` means the pool is exhausted, which is the condition the
+    /// Moves the shared endpoint head past the entry it currently names and yields the entry the head
+    /// lands on - `switchBaseUrl()` for the endpoint-rotating clients
+    /// (`local-strata.ts:243-261`). `None` means nothing remains to dial, which is the condition the
     /// route loops turn into [`EXHAUSTED_BASE_URLS_MESSAGE`].
+    ///
+    /// SEAM, not the production path. Production rotation is per request, inside
+    /// `crate::client::ModelClient::dispatch`, and publishes past the entry THAT request dialled;
+    /// this call publishes past the entry the SHARED head names, which is the same thing only while
+    /// the caller is alone. It stays public because the parity surface (`switchBaseUrl`) and the
+    /// suites that walk a whole pool need it, and it is documented as a seam exactly like
+    /// [`Transport::reset_rotation`] is.
+    ///
+    /// Its exhaustion boundary is NOT the client seam's. Here, `position >= last` answers `None`
+    /// WITHOUT publishing, so the last entry stays unverified in the head; the client-side seam
+    /// (`crate::client::ModelClient::switch_base_url`'s relay arm, which runs
+    /// `crate::client::ModelClient::advance_walk`) publishes that last verification - `head := len`,
+    /// one past the pool - and only then answers `false`. That asymmetry is deliberate: the client
+    /// arm reports a walk that DID collect the last entry's 404, so the head must say so, while this
+    /// call is a pure "is anything left to dial?" answer and never invents a verification it has not
+    /// been paid for. A caller that needs the head to reach `len` must use the client seam (or the
+    /// production walk), not this one.
     #[must_use]
     pub fn rotate_endpoint(&self) -> Option<Endpoint> {
-        // `advance` yields the slot index, or `None` once the pool is exhausted; the caller only ever
-        // wants the entry itself.
-        advance(&self.endpoint_cursor, &self.target.endpoints)
-            .and_then(|index| self.target.endpoints.get(index).cloned())
+        // One personal 404 at the entry the head names: publish past it, then hand back what the head
+        // now points at. `endpoint_start` is the clamped read, so a head that is already past the end
+        // answers `None` instead of dialling past the pool.
+        let position = self.endpoint_start()?;
+        let last = self.endpoint_last_index()?;
+
+        if position >= last {
+            return None;
+        }
+
+        // The publish is the point here; the returned head belongs to whoever reads it next.
+        let _ = self.verify_endpoint(position);
+
+        self.endpoint_at(position + 1)
     }
 
     /// Advances to the next credential - `switchBaseUrl()` for the credential-rotating clients
     /// (`nvidia-glm5-flash.ts:80-85`). `None` means no credential remains.
+    ///
+    /// The credential axis keeps the claim-a-slot cursor, and correctly so: rotating a credential pool
+    /// takes a key OUT of the pool for every caller, so each rotation must hand its caller the slot IT
+    /// claimed. That is what [`advance`] returns (see its doc).
     #[must_use]
     pub fn rotate_credential(&self) -> Option<Credential> {
-        // Same shape as [`Transport::rotate_endpoint`]: index from `advance`, entry from the pool.
+        // Same shape as `Transport::rotate_endpoint` used to have: index from `advance`, entry from
+        // the pool.
         advance(&self.credential_cursor, &self.target.credentials)
             .and_then(|index| self.target.credentials.get(index).cloned())
     }
@@ -1210,7 +1382,7 @@ impl Transport {
     /// Whether another endpoint rotation is possible, i.e. whether a failover could still help.
     #[must_use]
     pub fn endpoints_exhausted(&self) -> bool {
-        self.endpoint_cursor.load(Ordering::SeqCst) + 1 >= self.target.endpoints.len()
+        self.endpoint_head.load(Ordering::SeqCst) + 1 >= self.target.endpoints.len()
     }
 
     /// Whether another credential rotation is possible.
@@ -1221,8 +1393,12 @@ impl Transport {
 
     /// Rewinds both cursors to the pool heads: a process-level re-initialisation, and the seam a test
     /// uses to observe rotation from the beginning.
+    ///
+    /// NOT part of the TypeScript parity surface - a live process never rewinds a drained pool, and
+    /// nothing calls it in production. On the endpoint axis it also erases the head's "personally
+    /// verified" bookkeeping, which is only true of a pool that has been re-probed.
     pub fn reset_rotation(&self) {
-        self.endpoint_cursor.store(0, Ordering::SeqCst);
+        self.endpoint_head.store(0, Ordering::SeqCst);
         self.credential_cursor.store(0, Ordering::SeqCst);
     }
 
@@ -1304,16 +1480,22 @@ impl Transport {
         let budget = 1 + self.policy.max_retries;
         let child = options.signal.child_token();
 
-        loop {
-            let Some(endpoint) = self.current_endpoint() else {
-                return Err(TransportFailure::new(
-                    TransportError::Build {
-                        detail: "the upstream target has no endpoint".to_owned(),
-                    },
-                    state,
-                ));
-            };
+        // THE DIAL TARGET IS RESOLVED ONCE, BEFORE THE RETRY LOOP. A pin the caller supplied wins; an
+        // unpinned caller (model discovery via `get_json`, or a suite driving the transport directly)
+        // dials the shared selection AS IT STANDS WHEN THIS CALL STARTS. Either way, no iteration of
+        // the loop re-reads shared state, so the 429 pause and the timeout/connection retries all stay
+        // on the upstream the request started on - the property the per-request walk in
+        // `crate::client` depends on.
+        let Some(endpoint) = options.endpoint.clone().or_else(|| self.current_endpoint()) else {
+            return Err(TransportFailure::new(
+                TransportError::Build {
+                    detail: "the upstream target has no endpoint".to_owned(),
+                },
+                state,
+            ));
+        };
 
+        loop {
             let credential = self.current_credential();
             let credential_index = self.credential_index();
             let url = endpoint.request_url(path);
@@ -1629,13 +1811,18 @@ fn put_header(headers: &mut Vec<(HeaderName, HeaderValue)>, name: HeaderName, va
     }
 }
 
-/// Moves one rotation cursor forward, and reports exhaustion when there is nothing left.
+/// Claims the next slot of one rotation cursor, and reports exhaustion when there is nothing left.
 ///
-/// `try_update` is the atomic step: two requests racing on the same shared transport cannot both
-/// take the same slot, which is what the TypeScript singletons get from their single-threaded event
-/// loop and a Rust multi-thread runtime has to get from an atomic. On exhaustion the cursor stays on
-/// the LAST entry: `local-strata.ts:244-250` returns false WITHOUT clearing `baseURL`, so the entry
-/// that was selected last stays in force.
+/// `try_update` is the atomic step, and the value IT hands back is the PREVIOUS one; the slot this
+/// call claimed is therefore `previous + 1`, and that is what this function returns. Re-loading the
+/// cursor afterwards - this function's previous shape - is the race that handed two racing callers the
+/// same slot: between the winning compare-and-swap and the re-load another thread can advance past it,
+/// so both callers collect the LATER value and the entry neither of them claimed is never served. A
+/// `fetch_max`-style publish cannot help here, because the credential axis genuinely hands out one
+/// entry per rotation (see [`Transport::rotate_credential`]).
+///
+/// On exhaustion the cursor stays on the LAST entry: `local-strata.ts:244-250` returns false WITHOUT
+/// clearing `baseURL`, so the entry that was selected last stays in force.
 #[must_use]
 fn advance<T>(cursor: &AtomicUsize, pool: &[T]) -> Option<usize>
 where
@@ -1643,13 +1830,17 @@ where
 {
     let last = pool.len().checked_sub(1)?;
 
-    cursor
+    // `Ok(previous_value)` on a won claim, `Err(_)` when the closure returned `None` (the cursor is on
+    // `last`, so there is no next slot). `try_update` re-runs the closure after a lost race, so every
+    // caller holding `Ok` claimed a distinct `previous` and therefore a distinct slot - and
+    // `previous < last` makes `previous + 1` a valid index.
+    let previous = cursor
         .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             (current < last).then_some(current + 1)
         })
         .ok()?;
 
-    Some(cursor.load(Ordering::SeqCst))
+    Some(previous + 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -2283,4 +2474,140 @@ pub fn estimate_request_tokens(request: &Value) -> u64 {
         .sum();
 
     units.div_ceil(4)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the two atomic primitives
+// ---------------------------------------------------------------------------
+//
+// These live INSIDE the module because `advance` is private, and because both tests are about the
+// arithmetic of one cursor: no HTTP, no listener, no timing assumptions beyond "these threads meet at
+// a barrier". The behaviour-level counterpart of each lives in `tests/transport.rs` and
+// `tests/clients.rs`, where the same invariants are asserted through real dials.
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    /// `advance` hands every racer the slot IT claimed: the returned indices are distinct, they cover
+    /// `1..=last` completely, the losers all answer `None`, and the cursor lands on `last`.
+    ///
+    /// This is the exactness half of the concurrency fix. The previous implementation returned
+    /// `cursor.load()` AFTER a won claim, so two racers could both report the later slot: one index
+    /// then appeared twice in `slots`, one index never appeared at all, and the pool entry behind the
+    /// missing index was never served to anyone. The assertion below is that exact multiset, so the
+    /// regression fails on a duplicate or a gap rather than on a fuzzy property.
+    #[test]
+    fn advance_hands_each_racer_the_slot_it_claimed() {
+        // The pool entries ARE their own indices, so a returned slot index and the entry it names are
+        // the same number and the test can state the answer exactly.
+        let pool: Vec<usize> = (0..16).collect();
+        let last = pool.len() - 1;
+        // A SHARED BORROW of the pool, not a move: `scope.spawn` closures live for the scope, so each
+        // racer can take the same `&[usize]` (which is `Copy`) instead of consuming the `Vec`.
+        let entries: &[usize] = &pool;
+        let cursor = Arc::new(AtomicUsize::new(0));
+        // More racers than slots: 24 threads race for `last` = 15 claims, so 9 of them must be the
+        // exhaustion answers, and every one of them must still be a DISTINCT claim.
+        let racers = 24_usize;
+        let barrier = Arc::new(Barrier::new(racers));
+
+        let claims: Vec<Option<usize>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..racers)
+                .map(|_| {
+                    let cursor = Arc::clone(&cursor);
+                    let barrier = Arc::clone(&barrier);
+
+                    scope.spawn(move || {
+                        // Everyone waits here, then walks into the same compare-and-swap together.
+                        barrier.wait();
+
+                        advance(&cursor, entries)
+                    })
+                })
+                .collect();
+
+            // Every thread is SPAWNED before the first one is joined: joining inside the map above
+            // would park the scope thread in front of a barrier the unspawned racers have not
+            // reached yet.
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("the racing thread did not panic"))
+                .collect()
+        });
+
+        // The multiset of claimed slots, and the count of exhaustion answers.
+        let mut slots: Vec<usize> = claims.iter().copied().flatten().collect();
+        let exhausted = claims.iter().filter(|claim| claim.is_none()).count();
+
+        slots.sort_unstable();
+        slots.dedup();
+
+        assert_eq!(
+            slots,
+            (1..=last).collect::<Vec<usize>>(),
+            "every slot 1..={last} is claimed by exactly one racer - no duplicate, no gap"
+        );
+        assert_eq!(
+            exhausted,
+            racers - last,
+            "the racers beyond the last slot are the exhaustion answers"
+        );
+        assert_eq!(
+            cursor.load(Ordering::SeqCst),
+            last,
+            "the cursor ends on the last entry, the exhaustion fallback the TS original documents"
+        );
+    }
+
+    /// `verify_endpoint` is a PUBLISH, not a claim: N racers that all verified the same entry agree on
+    /// one head (`entry + 1`), where the old endpoint cursor moved N times and N-1 of those steps
+    /// skipped an entry nobody had dialled.
+    #[test]
+    fn concurrent_verifications_of_one_entry_publish_one_head() {
+        let pool: Vec<Endpoint> = (0..8)
+            .map(|index| Endpoint::labeled(&format!("https://{index}.example/v1"), "relay"))
+            .collect();
+        let transport = Transport::new(Target::new(pool, Vec::new()));
+        let barrier = Arc::new(Barrier::new(16));
+
+        let heads: Vec<usize> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let transport = transport.clone();
+                    let barrier = Arc::clone(&barrier);
+
+                    scope.spawn(move || {
+                        barrier.wait();
+
+                        // All sixteen requests dial index 3 and get the 404 verdict from it.
+                        transport.verify_endpoint(3)
+                    })
+                })
+                .collect();
+
+            // Spawned before joined, for the barrier's sake (see the test above).
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("the racing thread did not panic"))
+                .collect()
+        });
+
+        assert!(
+            heads.iter().all(|head| *head == 4),
+            "sixteen concurrent 404s at index 3 publish head 4 exactly, saw {heads:?}"
+        );
+        assert_eq!(
+            transport.endpoint_head(),
+            4,
+            "and the shared head is that same value"
+        );
+        assert_eq!(
+            transport.endpoint_start(),
+            Some(4),
+            "so the next request starts at the first entry NOBODY has verified"
+        );
+    }
 }

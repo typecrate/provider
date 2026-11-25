@@ -65,10 +65,12 @@
 //! # Logging
 //!
 //! [`logging`] at the bottom of this file. The provider logs through the `tracing` facade - the
-//! per-completion token line (`src/serve.rs:617-629`), the `[failover]` lines
-//! (`src/client.rs:865-879`), the `[retry] HTTP 429` line whose stated intent is "so a pause is
-//! not invisible in the terminal" (`src/transport.rs:1415-1418`) and the vault-down `warn!`
-//! (`src/serve.rs:553`, whose own promise is that "a refused route has to be explainable from
+//! per-completion token line (`src/serve.rs:705-726`), the `[failover]` lines
+//! (`src/client.rs:1114-1132` — the walk's step line and the exhaustion line, both naming what THIS
+//! request dialled rather than a re-read of the shared selection), the `[retry] HTTP 429` line whose
+//! stated intent is "so a pause is not invisible in the terminal"
+//! (`src/transport.rs:1596-1600`) and the vault-down `warn!`
+//! (`src/serve.rs:589-594`, whose own promise is that "a refused route has to be explainable from
 //! the log alone"). `tracing`'s default dispatch is `NoSubscriber`, which answers `enabled(..)`
 //! with `false`, so an executable that installs nothing throws every one of those lines away.
 //! `tracing-subscriber` is not in any typecrate lockfile and would break

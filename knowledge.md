@@ -16,7 +16,7 @@ carries the reasoning and the consequences.
 ## Port map (what exists, what is next)
 
 The crate was built in waves, and the waves are named by the code itself rather than by this file:
-`src/transport.rs:563` records a "DEVIATION FROM **C2**", and `tests/registry.rs:1` labels the
+`src/transport.rs:593` records a "DEVIATION FROM **C2**", and `tests/registry.rs:1` labels the
 registry suite "(**C3**)". The map below is read off those labels, the module docs and the
 acceptance letters they cite.
 
@@ -26,7 +26,7 @@ acceptance letters they cite.
    `config/vault/knowledge.md` "Rust consumption contract".
 2. **C2 (done, then corrected) — the outbound transport.** `src/transport.rs` + `src/sse.rs` +
    `src/error.rs`: pools behind forward-only atomic cursors, the retry/429/404 rules, the SSE codec,
-   the failure taxonomy. The correction is recorded in-code at `transport.rs:563` (keyless headers
+   the failure taxonomy. The correction is recorded in-code at `transport.rs:593` (keyless headers
    were first hard-coded to "no header" for every keyless credential).
 3. **C3 (done) — rows, clients, registry.** `src/clients.rs` (29 rows), `src/client.rs` (the
    declarative client + `Behavior`), `src/registry.rs` (ordered, validated, process-wide). Pinned by
@@ -174,13 +174,13 @@ per-family differences are data: `vendor` injection for the gateway-routed famil
 
 ### Pool ownership, and two drain shapes rather than one
 
-- **Per client, not per family** (`client.rs:96-112`). TypeScript keeps its rotation queue at module
+- **Per client, not per family** (`client.rs:124-142`). TypeScript keeps its rotation queue at module
   scope (`nvidia/nvidia-glm5-flash.ts:9`, `makora/makora-glm-5-3.ts:5`), so four Nvidia clients share
   one queue and a key burned by one sibling is gone for the others. The Rust transport owns the cursor
   and takes its target by value, so each row rotates its own copy. Order is unchanged (document order,
   never re-sorted); drain *budget* is not: each row drains after its own `len` rotations. A later
   stage must not "fix" this into a shared `Arc` without re-deriving the drain tests.
-- **`NextOnEveryRotation` vs `SameThenNext`** (`client.rs:80-92`). NVIDIA shifts the head and returns
+- **`NextOnEveryRotation` vs `SameThenNext`** (`client.rs:110-122`). NVIDIA shifts the head and returns
   the new head (`nvidia/nvidia-glm5-flash.ts:13-18`); Makora shifts the head and returns the entry it
   removed (`makora/makora-glm-5-3.ts:6-10`), so with a single live key Makora wastes exactly one retry
   before draining. Collapsing them would change which credential serves a request — the property A4
@@ -191,28 +191,86 @@ per-family differences are data: `vendor` injection for the gateway-routed famil
   a drained row keeps sending its last credential, where the TypeScript sets `apiKey = ''`
   (`makora-glm-5-3.ts:86`, `nvidia-glm5-flash.ts:83`) and the SDK then sends no header at all. Both
   are hidden from `/models` either way (`is_discoverable` is computed, never cached,
-  `client.rs:114-134`) and both stay routable; only the header differs. Pinned at
+  `client.rs:144-164`) and both stay routable; only the header differs. Pinned at
   `tests/clients.rs:1242` and `tests/registry.rs:1052`.
 
-### The 404 failover boundary
+### The 404 failover boundary - one shared head, one pinned walk per request
 
-`transport.rs:55-63` returns a 404 as a **typed** verdict and never retries it; `client.rs:56-78` owns
-the rotation loop, because in TypeScript `switchBaseUrl()` is called by a 404 status handler inside a
-`while (true)` around `fetch` (`model-class.ts:933` is the method; the wrapper is the
-`:557-654` region). Two consequences that must not be re-broken: the rotation loop is **not** bounded
-by the retry budget (the SDK's own retries are neutralised upstream with `maxRetries: 0`), and the
-accounting wrapper sits **outside** the loop, so a request that rotates five times still counts one
+`transport.rs:84-93` returns a 404 as a **typed** verdict and never retries it
+(`TransportFailure::is_not_found`, `transport.rs:938`); `client.rs:56-108` states the rule and
+`client.rs:856-989` (`dispatch`) runs it, because in TypeScript `switchBaseUrl()` is called by a 404
+status handler inside a `while (true)` around `fetch` (`model-class.ts:933` is the method; the wrapper
+is the `:557-654` region). Two consequences that must not be re-broken: the rotation loop is **not**
+bounded by the retry budget (the SDK's own retries are neutralised upstream with `maxRetries: 0`), and
+the accounting wrapper sits **outside** the loop, so a request that rotates five times still counts one
 `requestTotal` and settles its prompt split once. The exhausted case is the route's sentence —
-`transport::EXHAUSTED_BASE_URLS_MESSAGE` (`transport.rs:174`) — which is the text the Responses route
+`transport::EXHAUSTED_BASE_URLS_MESSAGE` (`transport.rs:204`) — which is the text the Responses route
 throws by hand today (`runtime/endpoint/provider/private/responses/private-responses.ts:118`).
 
+**What the 2026-11-25 concurrency fix changed, and why the shape is now load-bearing.** Advancing ONE
+shared endpoint cursor by compare-and-swap is correct for one request at a time and wrong for ten:
+every concurrent 404 moved the shared selection one place for itself, so ten requests failing on the
+same dead relay skipped nine endpoints NOBODY had dialled, and each skipped entry became the upstream
+some request adopted without ever collecting a verdict from it. The loop is therefore per request:
+
+- **start** — `position = min(head, last)` is resolved ONCE at dispatch
+  (`Transport::endpoint_start`, `transport.rs:1281`, called at `client.rs:876`);
+- **pin** — every attempt dials `pool[position]` and hands that entry to the transport as
+  `RequestOptions::endpoint` (`transport.rs:1077`, `with_endpoint` at `:1145`), and `Transport::run`
+  resolves the dial target exactly once, BEFORE its retry loop (`transport.rs:1483-1498`). The 429
+  pause, the timeout and the dead-socket retries therefore cannot move a request to another upstream;
+- **verify** — a 404 from `pool[position]` publishes `head := max(head, position + 1)` with a
+  `fetch_max` (`Transport::verify_endpoint`, `transport.rs:1308`) and steps that request to
+  `position + 1` (`ModelClient::advance_walk`, `client.rs:1073-1123`); `position > last` is the
+  exhaustion, where the row records the failure and propagates the raw 404 (`client.rs:929-954`);
+- **nothing else moves the head** — `advance_walk` is the only production writer.
+  `ModelClient::switch_base_url`'s relay arm (`client.rs:1048`, `:1061`, the TS `switchBaseUrl` parity surface)
+  and `Transport::rotate_endpoint` (`transport.rs:1351`) survive as documented **seams** that publish
+  one step past the entry the SHARED head names, and `Transport::reset_rotation`
+  (`transport.rs:1400`) is a rewind no production path takes. All three say so in their own docs, so a
+  reader cannot mistake them for the request path.
+
+The invariant, and the price: for every `j < head`, `pool[j]` was PERSONALLY 404-dialled by some
+request, and each request's own dial sequence is contiguous — so no endpoint is skipped unverified at
+any level of concurrency. Concurrent requests consequently walk in **lockstep** and dial the same
+relays; that is accepted deliberately, because spreading across unverified relays *is* the bug.
+Verification is the real dial's verdict: no pre-flight health probe was invented, and the 404-only
+trigger, the retry budgets, the accounting and the credential axis are untouched. The credential axis
+keeps the claim-a-slot cursor `advance` returns (`transport.rs:1827`, handing back the slot it claimed
+rather than a re-read), which is right for a different job: rotating a key takes it out of the pool for
+EVERY caller, so each rotation must hand its caller the slot it claimed.
+
+**Attribution follows the dial, not the process.** `dispatch` builds a `ServedEndpoint`
+(`client.rs:471-508`) from the SAME entry it puts on the wire and returns it on the answer
+(`UpstreamAnswer`, `client.rs:510-530`); `serve.rs:646-653` (`RequestLog::capture`) logs from it, so
+`relay=` and the `[failover]` lines name a dial that happened even when another request rotates in
+between (`client.rs:1111-1113`). `Transport::upstream_label` (`transport.rs:1325`) and
+`ModelClient::upstream_label` (`client.rs:690`) stay as the TS-parity **state** read of the shared
+head — correct only while the process runs one request at a time, and their docs now say exactly that
+instead of claiming the deployed capture rule outright.
+
+Pinned by `tests/clients.rs::concurrent_requests_walk_the_verified_prefix_and_never_skip_an_endpoint`,
+`tests/clients.rs::concurrent_requests_all_walk_a_fully_outaged_pool_and_refuse`,
+`tests/clients.rs::a_second_request_starts_where_the_first_one_proved_the_pool_dead`,
+`tests/clients.rs::the_switch_base_url_seam_publishes_one_step_per_call`,
+`tests/transport.rs::a_pinned_request_dials_the_pin_and_never_the_shared_selection`,
+`tests/transport.rs::a_pinned_retry_stays_on_the_pinned_endpoint`, the two inline contentions in
+`src/transport.rs` (`advance_hands_each_racer_the_slot_it_claimed`,
+`concurrent_verifications_of_one_entry_publish_one_head`), and the timing-free capture case
+`src/serve.rs::the_request_log_names_the_endpoint_the_answer_carried_not_the_shared_selection`, which
+is the only case that DISCRIMINATES the capture mechanism: it publishes the shared head two entries past
+the serving endpoint, so a log that re-read the selection prints `relay-c` while this answer must print
+`relay-a`. Every live case answers with the relay the head already names, so none of them can tell the
+two implementations apart. The concurrency regression was written FIRST and observed RED against the
+unmodified crate before any source line changed.
+
 Related: `rebaseRequestInput` (`model-class.ts:141`) has **no** Rust counterpart, because the retry
-rebuilds its URL from the rotated endpoint instead of string-patching the previous attempt's URL
-(`transport.rs:61-63`).
+rebuilds its URL from the endpoint the request pinned instead of string-patching the previous
+attempt's URL (`transport.rs:1483-1498`).
 
 ### Retry policy is bounded, and spends the budget differently
 
-`transport.rs:65-85`. The deployed rule, re-verified line by line on this pass rather than assumed: the
+`transport.rs:95-117`. The deployed rule, re-verified line by line on this pass rather than assumed: the
 429 status handler pauses 3 s and returns `true` with NO attempt counter (`model-class.ts:572-576`
 inside the `while (true)` fetch wrapper at `:588-619`), so a relay that always answers 429 holds
 a request open indefinitely — the 30-minute per-attempt ceiling (`:624`) does not stop it, because
@@ -221,30 +279,30 @@ request forces `maxRetries: 0` (`:885-892`), so the SDK's own retries never run,
 no handler is returned un-retried (`:599-600`) — a dropped socket fails on the spot today.
 
 This port bounds EVERY retryable outcome to `1 + max_retries` (`MAX_RETRIES` = 3,
-`transport.rs:157`) and, in exchange, spends the budget on the connection and timeout failures
+`transport.rs:187`) and, in exchange, spends the budget on the connection and timeout failures
 the deployed provider surfaces immediately — justified by the TypeScript's own comment at
 `model-class.ts:625-627` (the budget exists for transient drops when an idle proxy connection
 is reaped mid cold-start).
-The 3 s pause is injectable (`transport.rs:584-590`) so a test proves the pause happened without
+The 3 s pause is injectable (`transport.rs:614-620`) so a test proves the pause happened without
 waiting for it. **Retry behaviour is explicitly not claimed to match the TypeScript**:
 `tests/transport.rs` pins the bounded count, the 404 rotation stop and the never-retried arms
-instead of a parity match, and README's deviation rows `transport.rs:77` / `:80` state the two
+instead of a parity match, and README's deviation rows `transport.rs:95-110` / `:110-117` state the two
 asymmetries an operator feels.
 
 ### Keyless is a policy, not a constant
 
-`transport.rs:88-101` and `:558-575`. Selecting the `none` sentinel must mean both "this endpoint needs
+`transport.rs:118-131` and `:578-605`. Selecting the `none` sentinel must mean both "this endpoint needs
 no credential" (a **usable** state: the model stays discoverable,
 `model-class.ts:32-35` and `:378`) and "here is what reaches the wire". The TypeScript is not one
 behaviour: `openai@6.42.0` builds the header from `apiKey` for anything that is not `null`
 (`node_modules/openai/client.js:233-241`), so every client with `apiKey: 'none'` sends
 `Authorization: Bearer none`, while the two local relays additionally pin
 `defaultHeaders: { Authorization: null }` (`local/local-strata.ts:161`, `local/local-basalt.ts:147`)
-and send nothing. `KeylessHeaderPolicy::SendNone` is `#[default]` (`transport.rs:570`) because that is
-what today's relays actually receive; `Suppress` (`:574`) is per-row and used by exactly
+and send nothing. `KeylessHeaderPolicy::SendNone` is `#[default]` (`transport.rs:600`) because that is
+what today's relays actually receive; `Suppress` (`:604`) is per-row and used by exactly
 `ClientSpec::keyless_relay()` (`clients.rs:97-103`). This is a **correction**, not a preference: the
 first cut of the module sent nothing for every keyless credential, which was wrong on every keyless
-row except the two relays (`transport.rs:97-100`, `:563`).
+row except the two relays (`transport.rs:127-131`, `:593`).
 
 ### Usage opt-in parity
 
@@ -257,21 +315,21 @@ verified samples: `nvidia/nvidia-glm5-flash.ts:76`, `daytona/daytona-qwen3-8.ts:
 Rust spelling is the row flag `requires_usage_option` (`client.rs:339-345`), defaulting to true and
 cleared only by `.without_usage_option()` (`clients.rs:151-160`) — legitimate only for the Responses
 passthrough, whose terminal event carries usage. The transport removes both the `null` and the absent
-spelling (`transport.rs:1663`, and `tests/clients.rs::stream_options_reaches_only_a_streaming_request_
+spelling (`transport.rs:1854`, and `tests/clients.rs::stream_options_reaches_only_a_streaming_request_
 that_needs_it`).
 
 ### Settlement without `finally`
 
 TypeScript settles a stream in `trackStream`'s `finally` (`model-class.ts:831`, folding through the
 block at `:859-878`), which runs on exhaustion, on a mid-stream throw **and** on abandonment. Rust has
-no `finally`, so `transport.rs:102-112` settles in two places — the terminal transition in `poll_next`
+no `finally`, so `transport.rs:132-142` settles in two places — the terminal transition in `poll_next`
 and `Drop` for abandonment — funnelled through one hook that is *taken*, so it fires exactly once, and
 `Drop` additionally cancels the request's child `CancellationToken` so the upstream body stops being
 read. Four paths are pinned by name in `tests/clients.rs` (`a_streamed_success_settles_exactly_once`,
 `an_undecodable_frame_settles_the_stream_as_a_failure_once`,
 `an_abandoned_stream_settles_once_and_is_not_a_failure`, `a_cancelled_stream_settles_once_as_a_failure`)
 and in `tests/transport.rs::the_settlement_fires_once_for_clean_failure_and_cancellation`.
-`transport.rs:1917` records the one judgement call: an undecodable frame is a fatal stream whose
+`transport.rs:2108` records the one judgement call: an undecodable frame is a fatal stream whose
 **origin** is `Transport` while the failure **code** stays `decode`, so a consumer that branches on the
 code still sees the TypeScript's class.
 
@@ -672,7 +730,7 @@ targets were added) reported exactly that: **175 passed, 0 failed, 0 ignored** (
 15 accounting / **19 bin_server** / 27 clients / **8 gateway** / 12 registry / 18 routes / 41 transport /
 2 doc tests), exit 0 — so the "173 vs 175" question is the doctest target, not a missing test. The
 doctests are the runnable examples in `src/vault.rs:900` (`load_from_str`) and
-`src/transport.rs:1677` (`prepare_body`) — the two lines `cargo test --doc` names. `fmt`, `check` and
+`src/transport.rs:1868` (`prepare_body`) — the two lines `cargo test --doc` names. `fmt`, `check` and
 `clippy -- -D warnings` were re-run on this pass too and are clean. The per-target breakdown and the gap
 list are in README's [Test parity and coverage](README.md#test-parity-and-coverage).
 
@@ -693,6 +751,37 @@ the artifact is do-not-touch; `--no-fail-fast` is also required for the tally, b
 stops at the first failing target. Note also that the doctest target only runs when cargo's configured
 `TMPDIR` (`Temp/rust`, `.cargo/config.toml:33`) exists — with it missing, `--doc` errors out with
 "failed to create temporary directory" and the two doc tests are silently absent from any total.
+
+**Recount, 2026-11-25 (the per-request endpoint walk).** `cargo test --locked --no-fail-fast` re-run at
+the end of that pass from `packages/typecrate/provider` reports **196 passed / 4 failed / 0 ignored**,
+per target: **37 lib unit** (35 passing, 2 failing) / 0 bin unit / 15 accounting / **19 bin_server** /
+**31 clients** / **8 gateway** / **12 registry** (10 passing, 2 failing) / **22 routes** /
+**54 transport** / **2 doc tests**. The count of test attributes is **198**, 198 + 2 = 200 cases, of
+which 196 pass. The failures are the SAME four the paragraph above names, and they reproduce with this
+pass's `src/` and `tests/` stashed (`git stash push -- src/ tests/` then re-run), which is how they were
+confirmed pre-existing rather than caused by the walk: the artifact now carries 45 `label` members where
+`vault.rs` pins 43, and 31 where it pins 28. What the pass ADDED is ten cases, all of them about the
+walk: the two inline `src/transport.rs` contentions (`advance_hands_each_racer_the_slot_it_claimed`,
+`concurrent_verifications_of_one_entry_publish_one_head`), the four `tests/clients.rs` walk cases
+(`concurrent_requests_walk_the_verified_prefix_and_never_skip_an_endpoint`,
+`concurrent_requests_all_walk_a_fully_outaged_pool_and_refuse`,
+`a_second_request_starts_where_the_first_one_proved_the_pool_dead`,
+`the_switch_base_url_seam_publishes_one_step_per_call`) and three `tests/transport.rs` cases
+(`rotation_walks_the_pools_and_then_reports_exhaustion`, rewritten to the seam's semantics,
+`a_pinned_request_dials_the_pin_and_never_the_shared_selection`,
+`a_pinned_retry_stays_on_the_pinned_endpoint`), plus the one inline `src/serve.rs` capture case
+(`the_request_log_names_the_endpoint_the_answer_carried_not_the_shared_selection`). The correction pass
+added no production behaviour: it swapped `behavior == ChatKeylessRelay` for the established
+`Behavior::rotates_endpoints` predicate, widened `ServedEndpoint::new` to `pub(crate)` so the capture
+case can be built, and documented the two precision points the review raised. The concurrency regression
+was written FIRST and
+observed RED against the unmodified crate — the pristine `src/` stashed back in, the same probe failing
+with `every request must reach an endpoint that answers: ["404 no route", …]` six times over, and the
+probe passing again once the walk landed. (Those two runs were captured in that pass's disposable
+scratch directory, `Temp/fix-endpoint/`, which is not an artifact; the probe file itself was deleted
+after it served that purpose.)
+`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` were re-run for this crate on the
+same pass and are clean.
 
 The suite is organised around the acceptance letters recorded in `tests/registry.rs:3-16` (A4–A9), and
 its discipline is that every expectation is read out of a TypeScript or Rust source **before** the code
@@ -730,11 +819,11 @@ TypeScript-side camelCase members verified separately, or numbers that are not l
 | --- | --- | --- | --- |
 | 1 | `lib.rs` attributed `write('data: [DONE]\n\n')` to `start.ts:1496-1501`, in a 1222-line file with no `DONE` anywhere | the sentinel is the **route's own** frame: `private-chat-completion.ts:163` yields `data: ${JSON.stringify(chunk)}` and `:186` yields `data: [DONE]` after clean exhaustion; the gateway turns each yielded string into a frame at `start.ts:853` (`await stream.write(chunk + '\n\n')`) | `src/sse.rs:28-34` and the `lib.rs` module table; `grep -rn 1496 src` is empty |
 | 2 | `lib.rs` named three functions that do not exist in the gateway (`errorSentence`, `errorPayload`, `emitStreamError`) | the only exported frame builder is `buildStreamErrorPayload` (`start.ts:635-705`); the mid-stream frame is written inline in the `streamSSE` catch at `start.ts:860-873` (`console.error` `:861`, `writeSSE` `:866-871`), and nothing follows it — hence no `[DONE]` after an error | `src/lib.rs:14` now names the real function and says in words that the three others are NOT gateway functions; `src/serve.rs:643` keeps one such sentence at the catch site |
-| 3 | `client.rs:145-159` justified the unported per-call `options.baseUrl` with `model-class.ts:573` | the file has no `baseUrl` identifier at all (the field is `baseURL`), `:573` is the 429 handler's `console.log`, and `create` takes one parameter (`:922-924`) | `src/client.rs:151-154` states the corrected evidence; the "not ported" conclusion stands |
+| 3 | `client.rs:175-189` justified the unported per-call `options.baseUrl` with `model-class.ts:573` | the file has no `baseUrl` identifier at all (the field is `baseURL`), `:573` is the 429 handler's `console.log`, and `create` takes one parameter (`:922-924`) | `src/client.rs:181-184` states the corrected evidence; the "not ported" conclusion stands |
 | 4 | `lib.rs` cited `model-class.ts:567-572` for the `stream_options.include_usage` opt-in | the rule is **per client** in 32 files (samples `nvidia-glm5-flash.ts:76`, `daytona-qwen3-8.ts:498`, `lightning-glm-5-3.ts:112`) and `model-class.ts` has no `stream_options` | `src/lib.rs:12` now says so and names the samples; the Rust row flag `requires_usage_option` (`client.rs:345`) matches all 32 |
 | 5 | `accounting.rs` said the two port counters are ignored by "the `/stats` projection" while `serve.rs` publishes them | rows omit them (`serve.rs:1098-1104`); `totals` publishes `attemptTotal` and `consecutiveFailures` (`serve.rs:1151-1158`) | the `accounting.rs` module doc (`:47-53`) now draws exactly that line |
 | 6 | the client lineage table cited `withModel` `:895-897`, `create` `:905-907`, `switchBaseUrl` `:929-931`, and `serve.rs` cited `:753-755` for the Responses pass-through | `withModel` `:899-901`, `create` `:922-924`, `switchBaseUrl` `:933-935`, `createResponses` → `responses.create(this.withModel(body))` at `:747-749` | `src/lib.rs:17`, `src/client.rs:40-46` (the corrected `:707`/`:708`/`:588-619` seam cites) and `src/serve.rs` deviation 2 |
-| 7 | TypeScript-side drift: `local/local-strata.ts:247` attributes its "[retry] HTTP 429" line to `model-class.ts:551`, which is blank (the line is `:573`) | as stated; the file is not this crate's to edit | left as found — recorded here so a future re-cite starts from `:572-576`; `src/transport.rs:290-292` records the same class of problem for the URL-rule cite |
+| 7 | TypeScript-side drift: `local/local-strata.ts:247` attributes its "[retry] HTTP 429" line to `model-class.ts:551`, which is blank (the line is `:573`) | as stated; the file is not this crate's to edit | left as found — recorded here so a future re-cite starts from `:572-576`; `src/transport.rs:320-322` records the same class of problem for the URL-rule cite |
 | 8 | a cite worth keeping: `serve.rs` and `provider-route.rs` cite `start.ts:780` for "one listener per distinct declared port" | `start.ts:777-781` is exactly the port-grouping phase | unchanged — re-verified, no edit |
 | 9 | the `RoutingVendor` doc listed eight `merge/merge-*.ts` call sites and then said "the **seven** names are the complete set" | eight call sites, **five** distinct vendors (`telnyx`, `pareto`, `modal`, `deepinfra`, `openai`) — which is why the enum has five variants | `src/lib.rs:17` ("eight `vendor:` injections (five distinct values)") and the `RoutingVendor` doc in `src/client.rs` |
 | 10 | `error.rs` cited `start.ts:319-327` for `STREAM_ERROR_CODES` | the doc comment is `:317`, the `as const` array `:318-326` (the six codes `:319-325`), and `:327` is the `StreamErrorCode` alias | `src/error.rs:6` and `:83` |
@@ -743,7 +832,7 @@ TypeScript-side camelCase members verified separately, or numbers that are not l
 | 13 | the same drift, one pass later, and this time inside **this package's own test and doc history**: the `create opts` bullet of `scripts/start-daytona.test.ts` (the cite sits at `:14` today) cited `setup-sandbox.ts:1565-1590`, the `summary` bullet (the cite sits at `:30` today) cited `runtime-deploy.ts:1579-1591` (both bodies had moved again), the same file's cargo comment (now `:387`) cited `runtime-deploy.ts:874-899`, row 12's own "really" numbers had been overtaken by the same churn, and README's closing drift note cited `scripts/deploy-endpoint.ts:154` and `:437`. Separately: the two `--out` tests asserted `resolve('Temp/out.tar.gz')`, which **cannot fail** — vitest's cwd is the repo root, so the buggy cwd answer and the correct repo-root answer are the same string | `createSandbox` is `setup-sandbox.ts:1565-1587` (the whole arrow, `};` at `:1587`; the `:1586` reported a pass earlier is the `};` that closes the **returned object**), `buildPublicUrl` is `runtime-deploy.ts:1579-1587`, `cargoArtifactCandidates` is `runtime-deploy.ts:874-898` (doc `:874-880` + body `:881-898`), and `RUNNER_PORT` is still `setup-sandbox.ts:234`; the two provider-script comments are `deploy-endpoint.ts:150-157` (`DEFAULT_PORT`) and `:438-445` (`portCollisionNotes`), and the start-modal comment is `start-modal.ts:27-30`; `_child_env` was `:1895-1899` and `BOX_LABEL` `:4540-4544` at that time — both are **history**: the Python runner was replaced by the Rust `runtime-server` (T31), and `BOX_LABEL` is `:343-345` today — so the production scripts' own cites (`:1894-1898`, `:4539-4543`) were then one line low; T36 re-pointed the live ones by symbol (`BOX_LABEL`, `_state_path`); the vitest totals are **86** (83 + 3 new `resolveOutPath` tests), proven against the bug by flipping `join(repoRoot, value)` back to `resolve(value)`: 5 tests fail with received `packages/typecrate/provider/Temp/out.tar.gz`, and the implementation was restored byte-identically (sha256 `2b0f2fd6…a8c6`) | `scripts/start-daytona.test.ts` (the two header cites and the cargo comment, each now naming `createSandbox` / `buildPublicUrl` / `cargoArtifactCandidates`), `scripts/deploy-endpoint.test.ts` (a `describe('resolveOutPath')` block and a `withCwd` fake — the `--out` flow tests now assert the literal `join(REPO_ROOT, …)` while the cwd is faked to the PACKAGE root, which is where `yarn workspace @typecrate/provider deploy:endpoint` actually starts), `README.md` (the `_child_env` span, the **86** totals, the closing drift note re-pointed at the declarations), and `knowledge.md` (the two port-map bullets, the two vitest totals, row 12 above, and this row) |
 | 14 | the three deploy verbs still described runtime **v1**: `deploy-endpoint.ts` declared a fixed `config.port: 8800`, no app name/`targetPrefix`, and POSTed `/` with a `--env PORT` warning; `start-daytona.ts` minted a second `getPreviewLink(<payload port>)` URL/token; start-modal's rationale assumed one occupied slot; the deploy docs asserted `GET /status` echoed `config.env` verbatim and readiness was a bare TCP connect | sandbox runtime v2 is a multi-app registry (spec §4/§7): the payload must name its app (`name: 'provider'`; omitted ⇒ the shared `default` alias) and its native base (`targetPrefix: '/providers/private/v1'`), `config.port` is auto-allocated unless `--port` names one, `PORT` is a reserved env key (R-8.3/R-8.4), readiness is the bin's own `/health` probed DIRECTLY on loopback (R-8.7; `/app/provider/health` would 404 under the prefix), `TYPECRATE_PROVIDER_HOST=127.0.0.1` is supplied by the client (R-8.5), the public base is endpoint + `result.path`, and AppView redacts env VALUES (R-5.1/R-5.2) rather than echoing them | `scripts/deploy-endpoint.ts` (v2 payload identity, auto port, `reservedEnvErrors`, `resolveAdminToken`, `teardownApp`/`tailAppLogs`, app-base/health output), `scripts/start-daytona.ts` (one origin, no `getPreviewLink`, internal-only port, admin credential into `createSandbox`), `scripts/start-modal.ts` (coexisting-apps rationale), the three colocated suites (**101** tests, including targetPrefix/loopback-host regressions and the no-second-preview case), and README/knowledge deploy excerpts (the `package.json` `#deploy` note still describes the v1 config: out of this pass's file ownership) |
 
-Two things this pass deliberately did **not** claim: the retry budget (row `transport.rs:77`/`:80` in
+Two things this pass deliberately did **not** claim: the retry budget (rows `transport.rs:95-110`/`:110-117` in
 README's deviation table) and the SSE decoder's three one-directional leniencies (`sse.rs:54-80`) are
 deviations, not citation errors, and they are recorded as such in README rather than "fixed" here.
 
@@ -860,18 +949,26 @@ loud, but only at first request.
   OpenAI-SDK-equivalent: the JS path retries 429 forever (`model-class.ts:572-576`) and the
   gateway never retries at all, because the SDK forces `maxRetries: 0` per request
   (`model-class.ts:885-892`).
+- **The endpoint head is a verified prefix, never a claim slot.** Nothing may advance it without having
+  PERSONALLY dialled the entry it is walking past (`Transport::verify_endpoint`, `transport.rs:1308`,
+  is the only production writer and it publishes with `fetch_max`), and no request may re-read the
+  shared selection mid-flight — the dial target is resolved once and pinned
+  (`transport.rs:1483-1498`). Re-introducing a `advance`-style CAS on this axis, or letting the
+  transport re-read `current_endpoint()` inside its retry loop, restores the exact race the 2026-11-25
+  pass removed: N concurrent 404s skipping N-1 endpoints nobody dialled. The credential axis keeps the
+  CAS on purpose (`transport.rs:1827`) — do not "unify" the two axes.
 - The **prompt estimate is over the caller's body**, the request bytes are the rewritten payload
   (`client.rs:39-54`).
 - **`requestTotal` counts rotations once** and counts failures (`accounting.rs:106-111`,
   `client.rs:68-70`).
 - **Exactly-once settlement** across exhaustion, failure, cancellation and abandonment
-  (`transport.rs:102-112`).
+  (`transport.rs:132-142`).
 - **`Cargo.lock` stays a subset** and axum stays feature-default (`Cargo.toml:189-205`), or the sibling
   service build and the offline build both move.
 - The **no-`charset` JSON content type** and the two SSE headers, byte for byte
   (`serve.rs:227-235`, pinned by `tests/routes.rs`).
 - **No credential in any printable path** — `Secret`, the label allow-list, the redaction gates, and
-  the two suite-level leak tests (`vault.rs:153-164`, `client.rs:1024-1059`, `error.rs:62-69`,
+  the two suite-level leak tests (`vault.rs:153-164`, `client.rs:1266-1308`, `error.rs:62-69`,
   `tests/transport.rs::no_credential_reaches_a_diagnostic_or_the_wire_detail`,
   `tests/clients.rs::no_credential_value_reaches_the_failure_vocabulary_or_the_debug_output`).
 - **The bin's credential gate stays BEFORE the bind** (`src/bin/server.rs:29-42`). Restoring the

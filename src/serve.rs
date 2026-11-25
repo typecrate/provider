@@ -136,7 +136,7 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
 
 use crate::accounting::{Counters, Totals};
-use crate::client::ModelClient;
+use crate::client::{ModelClient, UpstreamAnswer};
 use crate::error::{flatten_error_detail, redact_secrets};
 use crate::registry::Registry;
 use crate::sse::{DONE_FRAME, data_frame};
@@ -626,11 +626,14 @@ fn sse(stream: UpstreamStream, endpoint: &'static str, log: RequestLog) -> Respo
 
 /// The per-request facts the request log line needs, captured at the response HEAD.
 ///
-/// The label is captured HERE and never re-read after the stream drains, for the reason the
-/// TypeScript gives at `private-chat-completion.ts:106-122`: the registry clients are process-wide
-/// singletons whose endpoint cursor rotates, so reading `upstreamLabel` later would attribute this
-/// request to whichever relay the process happens to sit on when the last chunk lands. The token
-/// figures, by contrast, are read at settlement, because only then are they final.
+/// The label rides out of the upstream call on the answer itself
+/// ([`crate::client::UpstreamAnswer::served`]) — it is the NAME of the endpoint THIS request dialled,
+/// captured from the pin the request set, and it is what makes the line attributable. A re-read of the
+/// shared selection at this point would be the wrong fact under concurrency: the TypeScript can read
+/// `client.upstreamLabel` at the response head and be right, because a JS request holds that field
+/// between its own rotation and its own `fetch` (`private-chat-completion.ts:106-122`), while a Rust
+/// request can be interleaved with every other request in the process. The token figures, by contrast,
+/// are read at settlement, because only then are they final.
 #[derive(Clone, Debug)]
 struct RequestLog {
     /// The executing row, whose counters the line prints.
@@ -640,11 +643,12 @@ struct RequestLog {
 }
 
 impl RequestLog {
-    /// Captures the attribution at the instant the response head has arrived.
-    fn capture(client: &ModelClient) -> Self {
+    /// Captures the attribution from the answer the request produced: the endpoint it dialed, not the
+    /// endpoint the process happens to sit on.
+    fn capture(client: &ModelClient, answer: &UpstreamAnswer) -> Self {
         Self {
             client: client.clone(),
-            label: client.upstream_label(),
+            label: answer.relay().map(str::to_owned),
         }
     }
 
@@ -660,8 +664,9 @@ impl RequestLog {
     /// This is the "what is going on" line: until it prints, an operator with a request hanging in
     /// front of a relay has NOTHING to grep for, because the token line below only arrives when the
     /// body finishes and the failure line only when it dies. One `info!` per request, emitted at the
-    /// head for both the settled and the streaming shape, and it can only name the relay the request
-    /// actually used for the reason the struct's doc gives.
+    /// head for both the settled and the streaming shape, and the relay it names is the endpoint THIS
+    /// request dialled: the label rode out on the answer instead of being re-read from the shared
+    /// selection, for the reason the struct's doc gives.
     fn announce(&self, endpoint: &str) {
         tracing::info!(
             target: "typecrate_provider::serve",
@@ -1100,15 +1105,17 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
 
     // (5) The upstream call. The client owns the rewrite, the accounting and the 404 failover loop,
     // so that loop's terminal condition (`private-responses.ts:117-119`) arrives as one failure here
-    // instead of needing a second loop at the route.
-    let answer = match client.create(&document).await {
+    // instead of needing a second loop at the route. `create_tracked` because the answer has to carry
+    // the endpoint it was dialled from: the log line below names it, and the shared selection cannot
+    // say which relay served THIS request while other requests are in flight.
+    let answer = match client.create_tracked(&document).await {
         Ok(answer) => answer,
         Err(failure) => return upstream_throw(endpoint, &failure),
     };
 
-    // The attribution is read NOW: the response head has arrived, which is the only instant that can
-    // name the relay this request used.
-    let log = RequestLog::capture(client);
+    // The attribution comes from the answer, i.e. from the pin this request dialled with, at the
+    // instant the response head has arrived.
+    let log = RequestLog::capture(client, &answer);
 
     // The one extra line per request the operator asked for: it names the row and the relay while the
     // request is still in flight, so a stream that hangs is attributable before it settles. Both
@@ -1116,7 +1123,7 @@ async fn completion(state: &ServeState, request: Request, endpoint: &'static str
     // (the flight lines are `debug!`, and the token line still carries the settlement).
     log.announce(endpoint);
 
-    match answer {
+    match answer.response {
         ResponseOrStream::Response(completion) => {
             // The settled case: the line, then the completion document verbatim (`:201-225`).
             log.emit();
@@ -1756,9 +1763,11 @@ mod tests {
 
     use super::{
         DEFAULT_VAULT_ARTIFACT, MISSING_MODEL_FIELD_MESSAGE, MISSING_MODEL_KEYS_SHOWN,
-        REGENERATION_COMMAND, Unavailable, VaultSource, describe_top_level_keys, format_token_line,
-        group_thousands, query_value, to_fixed_two, vault_source_from_values,
+        REGENERATION_COMMAND, RequestLog, Unavailable, VaultSource, describe_top_level_keys,
+        format_token_line, group_thousands, query_value, to_fixed_two, vault_source_from_values,
     };
+    use crate::client::{ClientSpec, ModelClient, ServedEndpoint, UpstreamAnswer};
+    use crate::transport::{Endpoint, ResponseOrStream, Target, Transport};
 
     #[test]
     fn the_default_artifact_is_the_provider_crate_s_own_view_of_config_vault() {
@@ -1973,6 +1982,123 @@ mod tests {
         assert_eq!(
             vault_source_from_values(None, None),
             VaultSource::DefaultArtifact
+        );
+    }
+
+    /// THE CAPTURE MECHANISM, pinned with no timing and no thread pool.
+    ///
+    /// The live concurrency suite cannot discriminate here: by the time any of its requests reaches a
+    /// response head, the shared head has provably landed on the relay that answered, so an
+    /// implementation that re-read the SELECTION would log the same name by luck. This case forces the
+    /// two views apart deterministically - the answer carries `relay-a` (index 0) while the SHARED
+    /// head, published ahead by another request's verification, names `relay-c` (index 2) - and then
+    /// requires the log's relay half to name the served endpoint. Flip `RequestLog::capture` back to a
+    /// shared read and this test fails on the `relay-a` assertion while the concurrency tests keep
+    /// passing, which is exactly the gap the review pointed at.
+    #[test]
+    fn the_request_log_names_the_endpoint_the_answer_carried_not_the_shared_selection() {
+        let endpoints: Vec<Endpoint> = ["relay-a", "relay-b", "relay-c"]
+            .iter()
+            .map(|name| Endpoint::labeled(&format!("https://{name}.example.test/v1"), name))
+            .collect();
+        let transport = Transport::new(Target::new(endpoints, Vec::new()));
+        let client = ModelClient::new(
+            ClientSpec::relay(
+                "local/strata",
+                "Test",
+                "glm-5.3",
+                "strata",
+                "strata_api_endpoints",
+            ),
+            transport.clone(),
+        );
+
+        // The shared head is published past the serving entry: `verify_endpoint` is the SAME publish a
+        // concurrent request performs after its own 404, so this is the state a later request dials
+        // into - not a test-only mutation. The returned value is the publish arithmetic, which this
+        // test does not need; the head it leaves behind is the whole point.
+        let _ = transport.verify_endpoint(0);
+        let _ = transport.verify_endpoint(1);
+
+        // (1) Every SHARED view now names relay-c. This is the value a re-read would have logged.
+        assert_eq!(
+            transport.endpoint_head(),
+            2,
+            "relay-a and relay-b are verified, so the head stands on relay-c"
+        );
+        assert_eq!(
+            client.upstream_label(),
+            Some("relay-c".to_owned()),
+            "the shared-client read - the TypeScript's `client.upstreamLabel` - names relay-c"
+        );
+
+        // (2) The answer this request produced came from relay-a, three positions behind the head. The
+        // three fields are exactly what `ModelClient::dispatch` fills from the entry it PINNED.
+        let served_entry = transport
+            .endpoint_at(0)
+            .expect("relay-a is the pool's first entry");
+        let answer = UpstreamAnswer {
+            response: ResponseOrStream::Response(json!({ "id": "chatcmpl-attribution" })),
+            served: Some(ServedEndpoint::new(0, &served_entry, true)),
+        };
+
+        assert_eq!(
+            answer.relay(),
+            Some("relay-a"),
+            "the accessor the route logs is the SERVED label, whatever the shared head says"
+        );
+
+        // (3) The log line's own inputs, and the deployed line built from them.
+        let log = RequestLog::capture(&client, &answer);
+
+        assert_eq!(
+            log.label.as_deref(),
+            Some("relay-a"),
+            "`capture` reads the answer it was handed, never the client's shared selection"
+        );
+        assert_eq!(log.relay(), "relay-a", "and every line prints that relay");
+        assert_eq!(
+            format_token_line(
+                client.id(),
+                1_234,
+                56,
+                0.125,
+                78,
+                0.034,
+                log.label.as_deref()
+            ),
+            "relay-a: local/strata | input: 1,234 (56) [$0.13] | output: 78 [$0.03]",
+            "the token line leads with the relay that ANSWERED; a shared re-read would print relay-c"
+        );
+
+        // (4) The other arm of the same mechanism: a row that does NOT publish a relay label still
+        // prints the word `unlabelled`, because the answer carries `relay: None` - the shared head may
+        // know a name, and it is still not this row's to print.
+        let plain = ModelClient::new(
+            ClientSpec::plain(
+                "test/plain",
+                "Test",
+                "glm-5.3",
+                "test",
+                "test_api_keys",
+                "test_api_endpoints",
+            ),
+            transport.clone(),
+        );
+        let plain_answer = UpstreamAnswer {
+            response: ResponseOrStream::Response(json!({ "id": "chatcmpl-unlabelled" })),
+            served: Some(ServedEndpoint::new(0, &served_entry, false)),
+        };
+
+        assert_eq!(
+            plain_answer.relay(),
+            None,
+            "the label gate is the row's policy, applied when the answer is built"
+        );
+        assert_eq!(
+            RequestLog::capture(&plain, &plain_answer).relay(),
+            "unlabelled",
+            "so the line says so, even though the shared selection names relay-c"
         );
     }
 }

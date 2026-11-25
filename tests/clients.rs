@@ -28,7 +28,10 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -40,7 +43,7 @@ use axum::{
     response::Response,
     routing::any,
 };
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, future::join_all};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -54,8 +57,8 @@ use typecrate_provider::{
     pricing::Pricing,
     sse::{DONE_FRAME, data_frame},
     transport::{
-        Credential, Endpoint, KeylessHeaderPolicy, Policy, Target, Transport, TransportFailure,
-        UpstreamStream, estimate_request_tokens,
+        CHAT_COMPLETIONS_PATH, Credential, Endpoint, KeylessHeaderPolicy, Policy, Target,
+        Transport, TransportFailure, UpstreamStream, estimate_request_tokens,
     },
     vault::{Secret, load_from_str},
 };
@@ -308,6 +311,167 @@ impl Stream for ScriptedSse {
 }
 
 // ---------------------------------------------------------------------------
+// The endpoint-keyed upstream (for the concurrency suite)
+// ---------------------------------------------------------------------------
+
+/// The endpoint-keyed upstream's state: which paths answer, and the shared capture ledger.
+struct EndpointRulings {
+    /// The request paths that get a completion. Every other path answers the failover verdict (404).
+    viable: Vec<String>,
+    /// The same ledger `Upstream` is, so the assertions are the same exact `Vec<String>` comparisons.
+    upstream: Arc<Upstream>,
+}
+
+/// Starts an upstream whose verdict is keyed to the ENDPOINT PATH, not to a queue.
+///
+/// The queue-shaped `provider()` is deterministic only while ONE request is in flight: with eight
+/// requests running, "the next scripted reply" depends on arrival order, so it cannot express "every
+/// attempt that reaches relay-c succeeds, whoever made it". Keying the verdict to the path makes a
+/// dial's outcome a property of the ENDPOINT, which is exactly the assumption the no-skip contract is
+/// stated under, while `upstream.seen()` still records every attempt in arrival order.
+///
+/// `viable` names the relays that answer; the request path of a relay built by [`relay_row`] is
+/// `/{name}/v1/chat/completions`.
+async fn provider_by_endpoint(viable: &[&str]) -> (String, Arc<Upstream>) {
+    let upstream = Arc::new(Upstream::default());
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let address = listener
+        .local_addr()
+        .expect("the bound address of a loopback listener")
+        .to_string();
+
+    let ruled = Arc::new(EndpointRulings {
+        viable: viable
+            .iter()
+            .map(|name| chat_path(name, &address))
+            .collect::<Result<Vec<String>, String>>()
+            .expect("a viable relay name is a path segment"),
+        upstream: Arc::clone(&upstream),
+    });
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/{*path}", any(handle_by_endpoint))
+                .with_state(ruled),
+        )
+        .await
+        .expect("the scripted upstream lives until the process ends");
+    });
+
+    (address, upstream)
+}
+
+/// Answers the verdict the ENDPOINT dictates, after recording what arrived.
+async fn handle_by_endpoint(
+    State(ruled): State<Arc<EndpointRulings>>,
+    request: Request,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or("<binary>").to_owned(),
+            )
+        })
+        .collect();
+    let body = axum::body::to_bytes(request.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("the request body is readable");
+
+    ruled
+        .upstream
+        .seen
+        .lock()
+        .expect("ledger lock")
+        .push(Captured {
+            path: path.clone(),
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
+
+    if ruled.viable.contains(&path) {
+        return response(
+            StatusCode::OK,
+            "application/json",
+            Body::from(completion(2).to_string()),
+        );
+    }
+
+    response(
+        StatusCode::NOT_FOUND,
+        "application/json",
+        Body::from(json!({ "error": { "message": "no route" } }).to_string()),
+    )
+}
+
+/// The path a relay row dials on one listener: `/{relay}/v1/chat/completions`.
+///
+/// It is derived from `Endpoint::request_url` rather than written by hand, so the key the upstream
+/// matches on and the URL the transport composes cannot drift apart - the strip below IS the drift
+/// detector, and it fails the test loudly if `Endpoint` ever composes something else.
+fn chat_path(relay: &str, address: &str) -> Result<String, String> {
+    let url = Endpoint::labeled(&format!("http://{address}/{relay}"), relay)
+        .request_url(CHAT_COMPLETIONS_PATH);
+    let origin = format!("http://{address}");
+
+    url.strip_prefix(&origin)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("the dialled URL {url} is not under the listener origin {origin}"))
+}
+
+/// The paths one request dialled, in arrival order, recovered from the `probe` tag the request put in
+/// its OWN body.
+///
+/// A shared listener cannot say which request sent what, but the relay rewrite passes unknown body
+/// keys through untouched, so a tag travels with the attempt and the ledger becomes per-request
+/// without any cooperation from the client.
+fn dialled_by(upstream: &Upstream, tag: &str) -> Vec<String> {
+    upstream
+        .seen()
+        .into_iter()
+        .filter(|attempt| attempt.sent().get("probe").and_then(Value::as_str) == Some(tag))
+        .map(|attempt| attempt.path)
+        .collect()
+}
+
+/// Opens a gate once `expected` tasks have reached it.
+///
+/// Written with an atomic plus `yield_now` because this crate's tokio dev-dependency deliberately does
+/// NOT enable `sync` (`Cargo.toml`'s lockfile comment explains the five-package leak that feature
+/// would cause).
+///
+/// Why the tests need one: the walk a request walks depends on the head AT ITS START, and a request
+/// that starts after the pool has been probed legitimately begins further along. Pinning the FULL
+/// prefix in the assertions therefore requires every request to start before the first 404 can be
+/// processed - and nothing between the gate and `Transport::endpoint_start` awaits, so a gate that
+/// opens when everyone has arrived is exactly the guarantee needed. Bounded, so a scheduling surprise
+/// fails with a message instead of hanging the suite.
+async fn start_gate(started: &AtomicUsize, expected: usize) {
+    started.fetch_add(1, Ordering::SeqCst);
+
+    for _ in 0..10_000 {
+        if started.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    panic!(
+        "only {} of {expected} requests reached the start gate",
+        started.load(Ordering::SeqCst)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test-side construction
 // ---------------------------------------------------------------------------
 
@@ -436,6 +600,27 @@ fn single_endpoint(address: &str) -> Vec<Endpoint> {
 /// A chat row over one scripted upstream with `credentials` as its pool.
 fn client_with_pool(spec: ClientSpec, address: &str, credentials: Vec<Credential>) -> ModelClient {
     client_on(spec, single_endpoint(address), credentials)
+}
+
+/// A keyless RELAY row over one listener, one named endpoint per name in `names`, plus its transport.
+///
+/// The transport comes back too because the walk's shared state lives on it: a test that only holds
+/// the client can assert what was dialled but not what the verified-prefix HEAD now claims
+/// (`Transport::endpoint_head`), which is the other half of the no-skip contract. Built exactly like
+/// `client_on_with` builds a row, so the only difference is the pool shape.
+fn relay_row(spec: ClientSpec, address: &str, names: &[&str]) -> (ModelClient, Transport) {
+    let endpoints = names
+        .iter()
+        .map(|name| Endpoint::labeled(&format!("http://{address}/{name}"), name))
+        .collect();
+
+    let target = Target::new(endpoints, Vec::new())
+        .keyless(spec.credential_slot.is_none())
+        .keyless_header(spec.keyless_header);
+
+    let transport = Transport::with_http_client(target, Policy::standard(), http_client());
+
+    (ModelClient::new(spec, transport.clone()), transport)
 }
 
 /// The request body every test starts from. `stream` is added per test, so the rewrite decisions
@@ -1395,6 +1580,511 @@ async fn an_invalid_pool_head_is_still_the_head_on_the_wire() {
         client.enabled(),
         "`enabled` is the declared flag, not the credential state"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The per-request endpoint walk (the concurrency fix)
+// ---------------------------------------------------------------------------
+//
+// The behaviour under test is the one the deployed gateway got wrong: with concurrent requests, the
+// shared endpoint selection advanced once per FAILING REQUEST and was then re-read before each dial,
+// so a request adopted - and logged - endpoints it had never dialled, and whole relays were skipped
+// without anyone receiving a verdict from them. The fix is a per-request walk plus a shared
+// verified-prefix HEAD, so the assertions below are all of one shape: a request's dial sequence is a
+// CONTIGUOUS run in pool order, each step taken because the previous step answered 404 to THAT
+// request, and the head says exactly what has been proved dead.
+//
+// The upstream is endpoint-keyed (`provider_by_endpoint`) rather than queue-scripted, because a queue
+// hands "the next reply" out in arrival order and that is not a fact about an endpoint. Every request
+// tags its own body with a `probe` key, which the relay rewrite passes through untouched, so the
+// shared capture ledger can be split back per request (`dialled_by`).
+
+/// Eight concurrent requests over a four-relay pool whose first two relays answer 404 to everybody.
+///
+/// The contract, in the order the assertions check it:
+///   1. no request was failed by a race - the third relay answers, so every request reaches an answer;
+///   2. every request's OWN walk is a CONTIGUOUS suffix of the verified prefix ending at the first
+///      relay that answers: it steps one entry per 404 it personally collected, so no relay is adopted
+///      unverified and none is skipped. The exact set of legal walks is therefore
+///      `a -> b -> c`, `b -> c` or `c`, depending on where the shared head stood when THAT request
+///      resolved its start - and somebody, the first arrival, walked the whole prefix;
+///   3. the relay BEYOND the first viable one is never dialled by anyone - concurrency did not "spread"
+///      the load across the pool, which is what used to happen and what used to skip;
+///   4. the attribution each request carries names the relay IT dialled (`relay-c`), not whatever the
+///      shared head happens to point at when the head arrives;
+///   5. the shared head ends at index 2: relays a and b have been personally 404-verified by someone,
+///      relay-c is the first unverified entry, and relay-d is still unverified too - eight concurrent
+///      publishes of the same entry moved the head ONCE, which is the `fetch_max` property.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_walk_the_verified_prefix_and_never_skip_an_endpoint() {
+    const REQUESTS: usize = 8;
+    const NAMES: [&str; 4] = ["relay-a", "relay-b", "relay-c", "relay-d"];
+
+    let (address, upstream) = provider_by_endpoint(&["relay-c", "relay-d"]).await;
+    let (client, transport) = relay_row(row("local/strata").keyless_relay(), &address, &NAMES);
+
+    // Every request starts only once all of them have arrived, so each one resolves its walk start from
+    // an un-probed pool (`head == 0`) and the exact prefix below is a fact about the contract rather
+    // than a fact about task order.
+    let started = Arc::new(AtomicUsize::new(0));
+
+    let handles: Vec<_> = (0..REQUESTS)
+        .map(|index| {
+            let client = client.clone();
+            let started = Arc::clone(&started);
+
+            tokio::spawn(async move {
+                start_gate(&started, REQUESTS).await;
+
+                let body =
+                    json!({ "model": "x", "probe": format!("req-{index}"), "stream": false });
+
+                client.create_tracked(&body).await
+            })
+        })
+        .collect();
+
+    let answers: Vec<_> = join_all(handles)
+        .await
+        .into_iter()
+        .map(|joined| joined.expect("the request task did not panic"))
+        .collect();
+
+    // (1) Nobody lost to the race.
+    let failures: Vec<String> = answers
+        .iter()
+        .filter_map(|answer| answer.as_ref().err())
+        .map(|failure| {
+            format!(
+                "{} {}",
+                failure
+                    .status()
+                    .map_or_else(String::new, |status| status.to_string()),
+                failure.error().message()
+            )
+        })
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "every request must reach a relay that answers: {failures:?}"
+    );
+
+    // (2) Each request's OWN walk, in the order the upstream saw it. The three vectors below are the
+    // COMPLETE legal set, not a range: the prefix `relay-a -> relay-b -> relay-c` for the request that
+    // resolved its start on an un-probed pool, and the contiguous suffixes of it for the requests that
+    // arrived while the head was already moving (a request starts at `min(head, last)`, so one that
+    // arrives after a and b were verified dials `relay-c` and stops). A gap, a jump past an unverified
+    // entry, or a stop before an answering relay is the bug - and none of those is in this set.
+    let expected: Vec<String> = ["relay-a", "relay-b", "relay-c"]
+        .iter()
+        .map(|relay| chat_path(relay, &address))
+        .collect::<Result<Vec<String>, String>>()
+        .expect("a relay name is a path segment");
+    let legal_walks: Vec<Vec<String>> = vec![
+        expected.clone(),
+        expected[1..].to_vec(),
+        expected[2..].to_vec(),
+    ];
+
+    let mut someone_walked_the_prefix = false;
+
+    for index in 0..REQUESTS {
+        let walked = dialled_by(&upstream, &format!("req-{index}"));
+
+        assert!(
+            legal_walks.contains(&walked),
+            "request {index} dialed {walked:?}; the only legal walks are the contiguous suffixes \
+             {legal_walks:?} of the verified prefix, one step per 404 the request personally collected"
+        );
+
+        someone_walked_the_prefix |= walked == expected;
+    }
+
+    assert!(
+        someone_walked_the_prefix,
+        "somebody arrived at the un-probed pool and must have walked the whole prefix \
+         relay-a -> relay-b -> relay-c"
+    );
+
+    // (3) Nobody may be "spread" past the first answering relay, and every relay of the prefix must
+    // have been dialed by SOMEONE: skipping is what this contract forbids.
+    assert!(
+        upstream
+            .seen()
+            .iter()
+            .all(|attempt| !attempt.path.starts_with("/relay-d")),
+        "relay-d sits past the first viable relay, so nobody may dial it"
+    );
+
+    for relay in ["relay-a", "relay-b", "relay-c"] {
+        let prefix = format!("/{relay}/");
+
+        assert!(
+            upstream
+                .seen()
+                .iter()
+                .any(|attempt| attempt.path.starts_with(&prefix)),
+            "{relay} is inside the verified prefix, so at least one request must have dialed it"
+        );
+    }
+
+    // The wire's own count and the per-request tags are two separate observations of the same walks,
+    // so they must agree attempt for attempt.
+    let walked_total: usize = (0..REQUESTS)
+        .map(|index| dialled_by(&upstream, &format!("req-{index}")).len())
+        .sum();
+
+    assert_eq!(
+        upstream.attempts(),
+        walked_total,
+        "the shared wire ledger and the per-request tags account for the same attempts - nothing was \
+         skipped and nothing was re-dialed"
+    );
+
+    // (4) Per-request attribution, straight from each answer.
+    for (index, answer) in answers.iter().enumerate() {
+        let answer = answer.as_ref().expect("(1) proved every answer is Ok");
+
+        assert_eq!(
+            answer.relay(),
+            Some("relay-c"),
+            "request {index} logged the relay it dialled, not the relay the shared head points at"
+        );
+
+        let served = answer.served.as_ref().expect("a served relay");
+
+        assert_eq!(served.index, 2, "the third relay of the pool");
+        assert_eq!(served.relay.as_deref(), Some("relay-c"));
+        assert_eq!(
+            served.base_url,
+            format!("http://{address}/relay-c/v1"),
+            "the URL that was dialled, normalised the way `Endpoint` normalises it"
+        );
+    }
+
+    // (5) The shared head, which is the only endpoint state concurrency shares.
+    assert_eq!(
+        transport.endpoint_head(),
+        2,
+        "relay-a and relay-b are personally 404-verified; eight concurrent publishes of the same \
+         entry moved the head once, not eight times"
+    );
+    assert_eq!(
+        transport.endpoint_index(),
+        Some(2),
+        "the selection view agrees with the head"
+    );
+    assert!(
+        !transport.endpoints_exhausted(),
+        "relay-d is still unverified, so a failover could still help"
+    );
+
+    let counters = counters_of(&client);
+
+    assert_eq!(
+        counters.request_total, REQUESTS as u64,
+        "eight logical requests"
+    );
+    assert_eq!(
+        counters.attempt_total, walked_total as u64,
+        "the client's own attempt counter and the wire ledger saw the same walks"
+    );
+    assert_eq!(
+        counters.consecutive_failures, 0,
+        "and every one of them succeeded"
+    );
+}
+
+/// A full outage under concurrency: every request walks from its own start to the LAST relay and
+/// refuses with the 404 it collected there, and the head ends one past the last index because the
+/// whole pool has been proved dead.
+///
+/// This is the exhaustion half of the contract, and the half the old cursor could not get right: a
+/// request that jumped ahead of the pool used to refuse without dialling the relays in between, so the
+/// terminal 404 named a walk that had not happened. Here each request's own ledger names exactly the
+/// relays IT dialled, in the order it dialled them, every relay of the pool has been dialled by
+/// somebody, and the legal walks are the contiguous suffixes `a -> b -> c -> d`, `b -> c -> d`,
+/// `c -> d` or `d` - the first arrival walks all four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_all_walk_a_fully_outaged_pool_and_refuse() {
+    const REQUESTS: usize = 6;
+    const NAMES: [&str; 4] = ["relay-a", "relay-b", "relay-c", "relay-d"];
+
+    // Nothing is viable: the endpoint-keyed upstream answers 404 for every path.
+    let (address, upstream) = provider_by_endpoint(&[]).await;
+    let (client, transport) = relay_row(row("local/strata").keyless_relay(), &address, &NAMES);
+
+    let started = Arc::new(AtomicUsize::new(0));
+
+    let handles: Vec<_> = (0..REQUESTS)
+        .map(|index| {
+            let client = client.clone();
+            let started = Arc::clone(&started);
+
+            tokio::spawn(async move {
+                start_gate(&started, REQUESTS).await;
+
+                let body =
+                    json!({ "model": "x", "probe": format!("req-{index}"), "stream": false });
+
+                client.create_tracked(&body).await
+            })
+        })
+        .collect();
+
+    let answers: Vec<_> = join_all(handles)
+        .await
+        .into_iter()
+        .map(|joined| joined.expect("the request task did not panic"))
+        .collect();
+
+    let whole_pool: Vec<String> = NAMES
+        .iter()
+        .map(|relay| chat_path(relay, &address))
+        .collect::<Result<Vec<String>, String>>()
+        .expect("a relay name is a path segment");
+
+    // The complete set of legal walks over a dead four-relay pool: a request starts at
+    // `min(head, last)` and steps to the end, so a request that arrives while other requests are still
+    // verifying the front of the pool begins further back. Nothing legal SKIPS an entry, and nothing
+    // legal turns around before the last entry - which is what the assertions below check.
+    let legal_walks: Vec<Vec<String>> = [0usize, 1, 2, 3]
+        .iter()
+        .map(|start| whole_pool[*start..].to_vec())
+        .collect();
+    let mut someone_walked_the_pool = false;
+
+    for (index, answer) in answers.iter().enumerate() {
+        // An outaged pool has NO answer to give, so the `Err` arm is the only shape here; a
+        // `Result`-shaped `panic!` keeps the refusal explicit instead of unwrapping a value that must
+        // not exist.
+        let failure = match answer.as_ref() {
+            Err(failure) => failure,
+            Ok(answer) => panic!("an outaged pool has no answer to give, got {answer:?}"),
+        };
+
+        assert_eq!(
+            failure.status(),
+            Some(StatusCode::NOT_FOUND),
+            "request {index} refuses with the 404 it personally collected, not an invented verdict"
+        );
+
+        let walked = dialled_by(&upstream, &format!("req-{index}"));
+
+        assert!(
+            legal_walks.contains(&walked),
+            "request {index} dialed {walked:?}; the only legal walks are the contiguous suffixes \
+             {legal_walks:?} of the pool, each ending at the last relay it refused on"
+        );
+
+        // THE ATTRIBUTION HALF: the terminal ledger must name exactly the relays THIS request dialed,
+        // in the order it dialed them, and no others. It is allowed to say "every base URL" only if
+        // this request saw every base URL it walked.
+        let walked_labels: Vec<Option<String>> = walked
+            .iter()
+            .map(|path| {
+                NAMES
+                    .iter()
+                    .find(|relay| path.starts_with(&format!("/{relay}/")))
+                    .map(|relay| (*relay).to_owned())
+            })
+            .collect();
+
+        assert_eq!(
+            failure
+                .state()
+                .attempted
+                .iter()
+                .map(|attempt| attempt.endpoint_label.clone())
+                .collect::<Vec<Option<String>>>(),
+            walked_labels,
+            "request {index}'s ledger names the relays it dialed, in order, and none another \
+             request dialed"
+        );
+
+        someone_walked_the_pool |= walked == whole_pool;
+    }
+
+    assert!(
+        someone_walked_the_pool,
+        "somebody arrived at the un-proved pool and must have walked every relay before refusing"
+    );
+
+    // The walk arithmetic again through two independent ledgers: the wire's own attempt count, and the
+    // sum of what each request reported dialing.
+    let walked_total: usize = (0..REQUESTS)
+        .map(|index| dialled_by(&upstream, &format!("req-{index}")).len())
+        .sum();
+
+    assert_eq!(
+        upstream.attempts(),
+        walked_total,
+        "every request dialled the part of the pool its own walk covered, and nothing else"
+    );
+
+    for relay in NAMES {
+        let prefix = format!("/{relay}/");
+
+        assert!(
+            upstream
+                .seen()
+                .iter()
+                .any(|attempt| attempt.path.starts_with(&prefix)),
+            "{relay} is part of the pool, and an exhausted refusal may only be reported once every \
+             relay has been dialed by someone"
+        );
+    }
+
+    assert_eq!(
+        transport.endpoint_head(),
+        NAMES.len(),
+        "one past the last index: every entry has been proved dead, and the reads clamp to the last"
+    );
+    assert_eq!(
+        transport.endpoint_index(),
+        Some(NAMES.len() - 1),
+        "the exhaustion fallback still names the last relay"
+    );
+    assert!(transport.endpoints_exhausted(), "and the row says so");
+
+    let counters = counters_of(&client);
+
+    assert_eq!(counters.request_total, REQUESTS as u64);
+    assert_eq!(
+        counters.attempt_total, walked_total as u64,
+        "the client counted exactly the attempts the wire recorded, and every request that refused \
+         counted one failure"
+    );
+    assert_eq!(
+        counters.consecutive_failures, REQUESTS as u32,
+        "every request failed, and none of them hid an attempt from the counters"
+    );
+}
+
+/// The head is not just bookkeeping: the NEXT request starts where the last one's walk proved the
+/// pool dead, and dials nothing before that point.
+///
+/// Sequential, single-threaded and fully deterministic - the concurrency tests above need a thread
+/// pool, this one needs only the contract: a request never re-dials an entry somebody has already
+/// been 404ed by, and `reset_rotation` (the seam) is the only way back to the pool head.
+#[tokio::test]
+async fn a_second_request_starts_where_the_first_one_proved_the_pool_dead() {
+    const NAMES: [&str; 4] = ["relay-a", "relay-b", "relay-c", "relay-d"];
+
+    let (address, upstream) = provider_by_endpoint(&["relay-c", "relay-d"]).await;
+    let (client, transport) = relay_row(row("local/strata").keyless_relay(), &address, &NAMES);
+
+    let body = |tag: &str| json!({ "model": "x", "probe": tag, "stream": false });
+
+    // Request one pays for the dead prefix.
+    client
+        .create(&body("req-1"))
+        .await
+        .expect("relay-c answers the first request");
+
+    assert_eq!(
+        transport.endpoint_head(),
+        2,
+        "a and b proved themselves dead"
+    );
+    assert_eq!(
+        dialled_by(&upstream, "req-1"),
+        ["relay-a", "relay-b", "relay-c"]
+            .iter()
+            .map(|relay| chat_path(relay, &address))
+            .collect::<Result<Vec<String>, String>>()
+            .expect("a relay name is a path segment"),
+        "the first request walks the whole dead prefix"
+    );
+
+    // Request two starts at the head, so it dials ONE relay.
+    client
+        .create(&body("req-2"))
+        .await
+        .expect("relay-c answers the second request too");
+
+    assert_eq!(
+        dialled_by(&upstream, "req-2"),
+        vec![chat_path("relay-c", &address).expect("a relay name is a path segment")],
+        "the second request inherits the verification instead of re-probing the pool"
+    );
+    assert_eq!(
+        upstream.attempts(),
+        4,
+        "three dials plus one, and the head moved for nobody"
+    );
+    assert_eq!(
+        transport.endpoint_head(),
+        2,
+        "a success does not advance the head: only a 404 this request collected does"
+    );
+
+    // The documented rewind: the seam puts the pool back to "nothing verified", and a request walks
+    // the dead prefix again.
+    transport.reset_rotation();
+
+    client
+        .create(&body("req-3"))
+        .await
+        .expect("relay-c answers the third request");
+
+    assert_eq!(
+        dialled_by(&upstream, "req-3"),
+        ["relay-a", "relay-b", "relay-c"]
+            .iter()
+            .map(|relay| chat_path(relay, &address))
+            .collect::<Result<Vec<String>, String>>()
+            .expect("a relay name is a path segment"),
+        "`reset_rotation` rewinds the head, so the dead prefix is paid for again"
+    );
+}
+
+/// `switch_base_url` on a relay row is a SEAM, and this pins what it does to the shared head: one
+/// publish per call, past the entry the head itself names, exactly as one personal 404 would.
+///
+/// It is the parity surface for `switchBaseUrl()` (`src/client.rs` documents why production no longer
+/// uses it for the relay axis), so the observable consequence has to stay honest: after two calls the
+/// head claims two relays verified, and the next request starts beyond them rather than at the pool
+/// head. A seam that advanced the head twice per call - the old claim-a-slot behaviour - would show up
+/// here as the third relay, not the third.
+#[tokio::test]
+async fn the_switch_base_url_seam_publishes_one_step_per_call() {
+    const NAMES: [&str; 4] = ["relay-a", "relay-b", "relay-c", "relay-d"];
+
+    let (address, upstream) = provider_by_endpoint(&["relay-c", "relay-d"]).await;
+    let (client, transport) = relay_row(row("local/strata").keyless_relay(), &address, &NAMES);
+
+    assert_eq!(transport.endpoint_head(), 0, "nothing is verified on build");
+
+    assert!(client.switch_base_url(), "one seam step");
+    assert_eq!(
+        transport.endpoint_head(),
+        1,
+        "the seam publishes exactly one entry, the one the head was naming"
+    );
+
+    assert!(client.switch_base_url(), "a second seam step");
+    assert_eq!(transport.endpoint_head(), 2);
+    assert_eq!(
+        transport.endpoint_index(),
+        Some(2),
+        "and the selection view moved with it, by one per call"
+    );
+
+    // A request that starts now begins at relay-c: the two seam steps are the only verification the
+    // pool has, and a request never dials behind the head.
+    client
+        .create(&json!({ "model": "x", "probe": "req-seam", "stream": false }))
+        .await
+        .expect("relay-c answers");
+
+    assert_eq!(
+        dialled_by(&upstream, "req-seam"),
+        vec![chat_path("relay-c", &address).expect("a relay name is a path segment")],
+        "the next request starts at the head the seam published"
+    );
+    assert_eq!(transport.endpoint_head(), 2, "and it published nothing new");
 }
 
 // ---------------------------------------------------------------------------

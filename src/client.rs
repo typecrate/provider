@@ -53,7 +53,7 @@
 //! (`model-class.ts:707` vs `:733`), so the estimate the dashboard divides by is
 //! the pre-rewrite figure. Both bodies are kept here for exactly that reason.
 //!
-//! ## The 404 failover loop lives here, not in the transport
+//! ## The 404 failover loop lives here, not in the transport - and it is a PER-REQUEST walk
 //!
 //! In the TypeScript, `switchBaseUrl()` is invoked by a `404` status handler
 //! installed inside a `while (true)` loop around `fetch`
@@ -68,6 +68,36 @@
 //!   * the accounting wrapper sits OUTSIDE that loop, so a request that rotates
 //!     five times still counts ONE request and settles its prompt split once
 //!     (`model-class.ts:707-708` runs once per `create()`).
+//!
+//! The one thing the TypeScript gets for free and this port cannot copy is SINGLE-THREADEDNESS.
+//! `switchBaseUrl()` mutates one `baseURL` field, and a JS request cannot be preempted between the
+//! mutation and the `fetch` that follows it, so "rotate, then dial what you just selected" is
+//! unambiguous there. Rust requests interleave across worker threads, and the same shape - advance a
+//! SHARED forward-only cursor, then re-read it before each dial - let every concurrent 404 move the
+//! selection once for itself. Ten requests failing on the same dead relay moved the selection ten
+//! places, and nine of them dialled an endpoint NOBODY had proved dead. That is the bug this layer now
+//! owns, and the fix lives here rather than in the transport because the walk is request state:
+//!   1. at dispatch start the request resolves `start = min(head, last)` ONCE
+//!      ([`crate::transport::Transport::endpoint_start`]) and carries its own `position`;
+//!   2. every attempt dials `pool[position]`, PINNED for the whole `post()` call
+//!      ([`crate::transport::RequestOptions::with_endpoint`]), so the transport's internal retries
+//!      (429 pause, timeout, dead socket) can never move the request to another upstream;
+//!   3. a 404 from `pool[position]` publishes `head := max(head, position + 1)`
+//!      ([`crate::transport::Transport::verify_endpoint`], a `fetch_max`) and steps the request to
+//!      `position + 1`; `position > last` is the exhaustion the TypeScript route turns into the
+//!      `all base URLs are exhausted` refusal;
+//!   4. nothing else advances the head. No rotation-count CAS, no public mutator that moves without a
+//!      personal 404: [`ModelClient::switch_base_url`]'s relay arm and
+//!      [`crate::transport::Transport::rotate_endpoint`] survive as documented SEAMS for the parity
+//!      surface and the suites, exactly like [`ModelClient::reset_rotation`] does.
+//!
+//! The invariant, stated because the whole design rests on it: for every `j < head`, `pool[j]` was
+//! PERSONALLY 404-verified by some request, and each request's own dial sequence is contiguous. So no
+//! endpoint is skipped unverified at any level of concurrency. Concurrent requests DO walk in
+//! lockstep and dial the same relays - the price of the invariant, and cheaper than the alternative,
+//! which was spreading across endpoints nobody had dialled. Verification is the real dial's verdict:
+//! this port adds no pre-flight health probe, and the 404-only trigger, the retry budgets and the
+//! accounting are untouched.
 //!
 //! On exhaustion the TypeScript route turns the still-404 response into
 //! `Service unavailable: all base URLs are exhausted (404 Not Found).` - the
@@ -154,9 +184,9 @@
 //! is recorded here rather than repeated. Nothing in this package passes such an option, so the Rust
 //! entry point is [`ModelClient::create`] with no override parameter. If a route task ever needs
 //! one, the knob belongs on the call, not on the row: rebuild the transport's
-//! `Target` with [`crate::transport::Endpoint::new`] for that request only, and
-//! accept that a fresh transport restarts the endpoint cursor at the pool head (the
-//! TypeScript's rotated client likewise holds no per-request pool position).
+//! `Target` with [`crate::transport::Endpoint::new`] for that request only, or — a request now
+//! carries its OWN dial target — pin it with [`crate::transport::RequestOptions::with_endpoint`]
+//! and leave the shared head alone: the caller, not a concurrent rotation, decides what it dials.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -169,7 +199,7 @@ use crate::accounting::{Accounting, Counters, StreamRecord, Totals};
 use crate::error::TransportError;
 use crate::pricing::Pricing;
 use crate::transport::{
-    self, CHAT_COMPLETIONS_PATH, KeylessHeaderPolicy, RequestOptions, ResponseOrStream,
+    self, CHAT_COMPLETIONS_PATH, Endpoint, KeylessHeaderPolicy, RequestOptions, ResponseOrStream,
     StreamOptions, StreamSettlement, Transport, TransportFailure,
 };
 
@@ -438,6 +468,70 @@ impl ClientSpec {
 /// `local-strata.ts:49` divides by eight to get its output limit.
 pub const DEFAULT_CONTEXT_LENGTH: u32 = 262_144;
 
+/// The endpoint one request actually dialled, captured from the pin that request set.
+///
+/// This type exists because the SHARED selection cannot answer "which relay served THIS request".
+/// [`ModelClient::upstream_label`] is a read of the shared head: correct on a single-request process
+/// (and it is what the TypeScript's `client.upstreamLabel` is), wrong the moment another request
+/// rotates in between, which is the exact failure mode the deployed gateway had. A walker carries the
+/// endpoint IT pinned out of [`ModelClient::dispatch`], so the `relay=` field of every log line names
+/// a dial that happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedEndpoint {
+    /// The index in the row's endpoint pool.
+    pub index: usize,
+    /// The relay NAME, `None` for a row that does not publish one - gated by
+    /// [`Behavior::publishes_relay_label`] exactly as [`ModelClient::upstream_label`] gates it, so the
+    /// two views can never disagree about whether a row has a label.
+    pub relay: Option<String>,
+    /// The normalised base URL that was dialled: public configuration, never a credential value.
+    pub base_url: String,
+}
+
+impl ServedEndpoint {
+    /// Names the pool entry at `index`, applying the row's label policy.
+    ///
+    /// `pub(crate)` rather than private so the request-log layer's own suite
+    /// (`src/serve.rs`'s `the_request_log_names_the_endpoint_the_answer_carried_not_the_shared_selection`)
+    /// can build an answer whose served entry is deliberately NOT the shared selection - the one state
+    /// a live listener cannot force. Production still has exactly one caller:
+    /// [`ModelClient::dispatch`].
+    pub(crate) fn new(index: usize, endpoint: &Endpoint, publishes_label: bool) -> Self {
+        Self {
+            index,
+            relay: publishes_label
+                .then(|| endpoint.label().map(str::to_owned))
+                .flatten(),
+            base_url: endpoint.base_url().to_owned(),
+        }
+    }
+}
+
+/// One upstream call's answer, plus the endpoint that served it.
+///
+/// The second half is the point: a caller that wants to say which relay produced a completion has to
+/// be handed the fact, because a re-read of shared state after the response head is a race with every
+/// other request in the process. `relay()` is the accessor the request log uses.
+#[derive(Debug)]
+pub struct UpstreamAnswer {
+    /// The settled document or the chunk stream: exactly what [`ModelClient::create`] returns.
+    pub response: ResponseOrStream,
+    /// The endpoint this request personally dialled. `None` only for a row whose endpoint pool is
+    /// empty, which cannot produce an answer at all.
+    pub served: Option<ServedEndpoint>,
+}
+
+impl UpstreamAnswer {
+    /// The relay half of the request-log line: the NAME of the endpoint this request dialled, `None`
+    /// when the row does not name its relays.
+    #[must_use]
+    pub fn relay(&self) -> Option<&str> {
+        self.served
+            .as_ref()
+            .and_then(|served| served.relay.as_deref())
+    }
+}
+
 /// One served model: the shared, process-wide client its rows describe.
 ///
 /// `Clone` is identity-preserving: a clone points at the SAME rotation cursors,
@@ -585,6 +679,13 @@ impl ModelClient {
     /// behaviour being preserved - the vault's non-local endpoint slots all carry
     /// one entry labelled `STANDARD`/`Standard`/`Default`, and publishing those
     /// labels would rename every log line in the deployment.
+    ///
+    /// WHAT THIS READ IS NOT: it is the SHARED head, so it names the entry the process currently sits
+    /// on, which is the entry a given request dialled only while that request is alone. The TypeScript
+    /// can treat the two as the same thing because one JS request owns the field between its rotation
+    /// and its `fetch`; a Rust request cannot, so per-request attribution is carried out of the call as
+    /// [`UpstreamAnswer::served`] and every route logs from that. This read stays for the state-style
+    /// consumers: `/stats`, the catalog, and the suites that assert which entry a rotation selected.
     #[must_use]
     pub fn upstream_label(&self) -> Option<String> {
         if !self.inner.spec.behavior.publishes_relay_label() {
@@ -659,7 +760,9 @@ impl ModelClient {
     ///
     /// NOT part of the TypeScript parity surface - a live process never rewinds a
     /// drained pool - it is the seam that lets a suite observe rotation from the
-    /// beginning without building a second client. It does not clear
+    /// beginning without building a second client. On the endpoint axis it also erases the
+    /// verified-prefix head, i.e. it claims nothing has been dialled yet, which is only true of a pool
+    /// a request will re-probe from entry zero. It does not clear
     /// [`Self::is_discoverable`]'s drain flag, so a test that needs the pre-drain
     /// state rebuilds the client.
     pub fn reset_rotation(&self) {
@@ -671,14 +774,19 @@ impl ModelClient {
 
     /// One upstream call: `client.create(body)` (`model-class.ts:652-653`).
     ///
+    /// The answer only. A caller that has to say WHICH relay produced it - every route does - uses
+    /// [`Self::create_tracked`], because the relay is this request's own state and re-reading the
+    /// shared selection after the head arrives is a race with every other request in the process.
+    ///
     /// # Errors
     ///
     /// The [`TransportFailure`] the attempt settled with, unchanged - including the
     /// raw 404 after every relay and credential has been exhausted, which is the
     /// value the route layer turns into a 503.
     pub async fn create(&self, body: &Value) -> Result<ResponseOrStream, TransportFailure> {
-        self.create_with_signal(body, CancellationToken::new())
+        self.create_tracked(body)
             .await
+            .map(|answer| answer.response)
     }
 
     /// [`Self::create`] with the caller's cancellation signal attached, so dropping
@@ -694,6 +802,34 @@ impl ModelClient {
         body: &Value,
         signal: CancellationToken,
     ) -> Result<ResponseOrStream, TransportFailure> {
+        self.create_tracked_with_signal(body, signal)
+            .await
+            .map(|answer| answer.response)
+    }
+
+    /// [`Self::create`], plus the endpoint this call actually dialled ([`UpstreamAnswer`]).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create`].
+    pub async fn create_tracked(&self, body: &Value) -> Result<UpstreamAnswer, TransportFailure> {
+        self.create_tracked_with_signal(body, CancellationToken::new())
+            .await
+    }
+
+    /// [`Self::create_with_signal`], plus the endpoint this call actually dialled.
+    ///
+    /// This is the entry point the routes use: the `relay=` half of the request log line, and the
+    /// `[failover]` lines that led to the answer, must name the dials THIS request made.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create`].
+    pub async fn create_tracked_with_signal(
+        &self,
+        body: &Value,
+        signal: CancellationToken,
+    ) -> Result<UpstreamAnswer, TransportFailure> {
         // One clock read at the entry, the way `accountUpstreamCall` captures
         // `startedAt` before the transport runs (`model-class.ts:710`). Every
         // settlement figure derives from this instant, which is what keeps the
@@ -717,16 +853,35 @@ impl ModelClient {
         self.dispatch(&payload, signal, prefill, started).await
     }
 
-    /// STEP 3: send, and rotate on a 404 until the failover axis is exhausted.
+    /// STEP 3: send, and walk the endpoint pool on a 404 until this request's failover axis is
+    /// exhausted.
+    ///
+    /// The walk is REQUEST state from the first line to the last: `position` is resolved once from the
+    /// shared verified-prefix head and then owned by this future, and every attempt carries the entry
+    /// it names as a PIN, so neither another request's 404 nor this request's own internal retry can
+    /// change what gets dialled.
     async fn dispatch(
         &self,
         payload: &Value,
         signal: CancellationToken,
         prefill: u64,
         started: Instant,
-    ) -> Result<ResponseOrStream, TransportFailure> {
+    ) -> Result<UpstreamAnswer, TransportFailure> {
         let mut resume: Option<transport::AttemptState> = None;
         let path = self.path();
+
+        // THE WALK STARTS ONCE, at the first entry nobody has proved dead: the head, clamped into the
+        // pool. `None` is the empty-pool case, which the transport still has to answer with its
+        // "target has no endpoint" verdict on the first attempt.
+        let mut position = self.inner.transport.endpoint_start();
+
+        // Only a row whose behavior rotates ENDPOINTS has an endpoint axis to walk. The predicate is
+        // the established one - the same set [`Behavior::drains_credentials`] splits the credential
+        // axis by - so a future relay behavior lands on both axes at once instead of half-walking.
+        // Every other row dials one pinned entry and fails over on the credential axis, or not at all
+        // (`ChatPlain` and friends refuse).
+        let walks_endpoints = self.inner.spec.behavior.rotates_endpoints();
+        let publishes_label = self.inner.spec.behavior.publishes_relay_label();
 
         loop {
             // One attempt per `post` call. `attempt_total` is a PORT addition, so it
@@ -734,11 +889,31 @@ impl ModelClient {
             // transport's own 429 retries are not visible on a success path.
             self.inner.accounting.record_attempt(1);
 
+            // The entry THIS request dials, resolved from its own position. The pool is immutable, so
+            // this value is the entry at `position` and nothing a concurrent walker can change.
+            let dialed = position.and_then(|index| self.inner.transport.endpoint_at(index));
+
+            // The attribution is built from the SAME entry that goes on the wire, so the `relay=` a
+            // caller logs and the URL the transport dialled cannot disagree - which is the property a
+            // re-read of the shared head could not give.
+            let served = match (position, dialed.as_ref()) {
+                (Some(index), Some(endpoint)) => {
+                    Some(ServedEndpoint::new(index, endpoint, publishes_label))
+                }
+                (Some(_), None) | (None, _) => None,
+            };
+
             // The settlement hook is installed per attempt: a rotated attempt owns a
             // different stream, and only the attempt that reaches a 2xx head can
             // settle anything. A settled (non-streaming) response never calls it -
             // this layer folds those figures itself.
             let mut options = RequestOptions::new().with_signal(signal.clone());
+
+            if let Some(endpoint) = dialed {
+                // THE PIN. The transport reads it once per `post` call and dials it through every
+                // internal retry, so this request cannot be moved by a concurrent rotation.
+                options = options.with_endpoint(endpoint);
+            }
 
             if let Some(state) = resume.clone() {
                 options = options.with_resume(state);
@@ -749,55 +924,67 @@ impl ModelClient {
                 client.settle_stream(prefill, started, &settlement);
             }));
 
-            let outcome = self.inner.transport.post(path, payload, options).await;
+            let answer = match self.inner.transport.post(path, payload, options).await {
+                Ok(answer) => answer,
+                Err(failure) => {
+                    // A 404 is the failover trigger (`model-class.ts:634-636`: the default
+                    // 404 handler IS `this.switchBaseUrl()`). Anything else - 429 after the
+                    // transport's own budget, a timeout, a dead socket - settles here and
+                    // propagates untouched, exactly as the TypeScript re-throws the original
+                    // error object (`model-class.ts:716-720`).
+                    let rotated = match (walks_endpoints, position.as_mut()) {
+                        (true, Some(position)) => {
+                            failure.is_not_found() && self.advance_walk(position)
+                        }
+                        // The credential axis keeps the TypeScript's shared-cursor flow untouched.
+                        (false, _) => failure.is_not_found() && self.switch_base_url(),
+                        // An empty pool: there was nothing to walk, so there is nothing to advance.
+                        (true, None) => false,
+                    };
 
-            let error = match outcome {
-                Ok(answer) => {
-                    // A settled response has no settlement hook, so its usage and
-                    // elapsed span fold in here - the non-streaming half of
-                    // `accountUpstreamCall` (`model-class.ts:724-730`).
-                    if let ResponseOrStream::Response(document) = &answer {
-                        // `readOutputTokens(usage)` receives the USAGE OBJECT, not the response
-                        // (`model-class.ts:724`), and that is `transport::output_tokens_of`'s
-                        // contract too - `StreamBody::absorb` passes it `chunk.usage`. The Option
-                        // reaches `record_response` intact, because the TypeScript guards on
-                        // `!== undefined` (`:725`): an absent usage block adds NOTHING rather
-                        // than a zero that would masquerade as a measured figure.
-                        let output_tokens =
-                            document.get("usage").and_then(transport::output_tokens_of);
-
+                    if !rotated {
+                        self.inner.accounting.record_failure();
+                        // "A failed attempt still consumed wall-clock time" (`:680-683`).
                         self.inner
                             .accounting
-                            .record_response(output_tokens, elapsed_millis(started));
+                            .record_elapsed(elapsed_millis(started));
+
+                        return Err(failure);
                     }
 
-                    self.inner.accounting.record_success();
+                    // Carry the ledger into the rotated attempt: the next stream must not
+                    // re-stamp time-to-first-token, and the terminal failure must still be
+                    // able to name every endpoint the request burned through
+                    // (`transport::AttemptState`'s contract).
+                    resume = Some(failure.state().clone());
 
-                    return Ok(answer);
+                    continue;
                 }
-                Err(failure) => failure,
             };
 
-            // A 404 is the failover trigger (`model-class.ts:634-636`: the default
-            // 404 handler IS `this.switchBaseUrl()`). Anything else - 429 after the
-            // transport's own budget, a timeout, a dead socket - settles here and
-            // propagates untouched, exactly as the TypeScript re-throws the original
-            // error object (`model-class.ts:716-720`).
-            if !error.is_not_found() || !self.switch_base_url() {
-                self.inner.accounting.record_failure();
-                // "A failed attempt still consumed wall-clock time" (`:680-683`).
+            // A settled response has no settlement hook, so its usage and
+            // elapsed span fold in here - the non-streaming half of
+            // `accountUpstreamCall` (`model-class.ts:724-730`).
+            if let ResponseOrStream::Response(document) = &answer {
+                // `readOutputTokens(usage)` receives the USAGE OBJECT, not the response
+                // (`model-class.ts:724`), and that is `transport::output_tokens_of`'s
+                // contract too - `StreamBody::absorb` passes it `chunk.usage`. The Option
+                // reaches `record_response` intact, because the TypeScript guards on
+                // `!== undefined` (`:725`): an absent usage block adds NOTHING rather
+                // than a zero that would masquerade as a measured figure.
+                let output_tokens = document.get("usage").and_then(transport::output_tokens_of);
+
                 self.inner
                     .accounting
-                    .record_elapsed(elapsed_millis(started));
-
-                return Err(error);
+                    .record_response(output_tokens, elapsed_millis(started));
             }
 
-            // Carry the ledger into the rotated attempt: the next stream must not
-            // re-stamp time-to-first-token, and the terminal failure must still be
-            // able to name every endpoint the request burned through
-            // (`transport::AttemptState`'s contract).
-            resume = Some(error.state().clone());
+            self.inner.accounting.record_success();
+
+            return Ok(UpstreamAnswer {
+                response: answer,
+                served,
+            });
         }
     }
 
@@ -843,6 +1030,17 @@ impl ModelClient {
     ///   * credential rotation for a draining row, which SETS `drained` when the
     ///     pool runs out - the `apiKey = ''` assignment those families make.
     ///
+    /// THE TWO ARMS ARE NOT ON THE SAME FOOTING, and that is the concurrency fix. The credential arm
+    /// IS the production path: [`ModelClient::dispatch`] calls this on its own 404, exactly as the
+    /// TypeScript's 404 handler calls `switchBaseUrl()`, because a credential rotation genuinely
+    /// takes a key out of the pool for everybody. The RELAY arm is not: a relay row rotates through
+    /// its own walk ([`ModelClient::advance_walk`]), since a shared advance cannot be per request and
+    /// a shared advance is what used to skip endpoints. This method keeps the relay arm - and its two
+    /// log lines - as a documented SEAM: it publishes past the entry the SHARED head names, which is
+    /// exactly what ONE personal 404 at that entry would do. The parity surface stays callable, the
+    /// suites can still drive a whole pool walk in document order, and no production code calls it for
+    /// a relay row.
+    ///
     /// Logging stays relay-only for parity: the credential families print nothing on
     /// rotation in the TypeScript (`nvidia-glm5-flash.ts:82-85`), and only names and
     /// labels are ever printed, never a credential value.
@@ -857,28 +1055,80 @@ impl ModelClient {
         }
     }
 
-    /// The relay axis: advance to the next named endpoint.
+    /// The relay arm of the seam above: one shared-head step, with the log lines a real rotation
+    /// prints. `false` once the head is past the last entry, the same answer
+    /// `local-strata.ts:244-250` gives when its queue has shifted empty.
     fn rotate_endpoint(&self) -> bool {
-        let Some(endpoint) = self.inner.transport.rotate_endpoint() else {
-            // The TypeScript's own exhaustion line, same register as its 429 retry
-            // line (`local-strata.ts:246-248`).
-            tracing::info!(
-                "[failover] {} exhausted \u{2014} no upstream relays remain",
-                self.id()
-            );
+        // Starting from the clamped head and running the walker's own step is deliberate: the seam and
+        // production then share one set of rules, with no second copy of the advance logic to drift.
+        let Some(mut position) = self.inner.transport.endpoint_start() else {
+            self.log_relays_exhausted();
 
             return false;
         };
 
-        // The label is the vault entry's NAME - never the URL, never a credential
-        // value (`local-strata.ts:254-256` says so explicitly).
-        tracing::info!(
-            "[failover] {} -> {}",
-            self.id(),
-            endpoint.label().unwrap_or(endpoint.base_url())
-        );
+        self.advance_walk(&mut position)
+    }
+
+    /// THE RELAY AXIS FOR ONE REQUEST: it received the failover verdict from `pool[*position]`, so it
+    /// publishes that verification, steps onto the next entry, and answers whether one remains.
+    ///
+    /// Exactly three things happen here, and this is the ONLY place the endpoint head may move in
+    /// production (module section "The 404 failover loop lives here, not in the transport - and it is a
+    /// PER-REQUEST WALK"):
+    ///   1. `head := max(head, position + 1)` - a `fetch_max`, so ten concurrent requests that 404 at
+    ///      the same entry publish ONE step rather than ten, and the nine entries the old cursor
+    ///      skipped stay exactly where they are: unverified, and next in line for everyone;
+    ///   2. `*position += 1`, which is request state no other request can see or corrupt;
+    ///   3. the `[failover]` line, naming `pool[position]` AFTER the step - the endpoint THIS request
+    ///      is about to dial, which is what makes the line a fact instead of a guess about the process.
+    ///
+    /// Past the last entry there is nothing left to dial, so the caller fails with the 404 it already
+    /// holds ([`ModelClient::dispatch`] records the failure): the same observable outcome the
+    /// TypeScript route reaches when `switchBaseUrl()` returns false, and the head may legitimately sit
+    /// one past `last` because every entry has now been proved dead by someone.
+    fn advance_walk(&self, position: &mut usize) -> bool {
+        // (1) The publish. `Transport::verify_endpoint` is the only production writer of the head.
+        let _ = self.inner.transport.verify_endpoint(*position);
+
+        // (2) The step: this request's own position, contiguous by construction.
+        *position += 1;
+
+        let Some(last) = self.inner.transport.endpoint_last_index() else {
+            // Unreachable from a real walk - an empty pool never reaches a dial - but stated rather
+            // than assumed, so the answer is `false` and not an off-by-one.
+            self.log_relays_exhausted();
+
+            return false;
+        };
+
+        if *position > last {
+            self.log_relays_exhausted();
+
+            return false;
+        }
+
+        // (3b) The label is the vault entry's NAME - never the URL, never a credential value
+        // (`local-strata.ts:254-256` says so explicitly) - and the entry named comes from this
+        // request's position, never from a second read of the shared head.
+        if let Some(endpoint) = self.inner.transport.endpoint_at(*position) {
+            tracing::info!(
+                "[failover] {} -> {}",
+                self.id(),
+                endpoint.label().unwrap_or(endpoint.base_url())
+            );
+        }
 
         true
+    }
+
+    /// The one exhaustion line, shared by the per-request walk and by the seam, in the TypeScript's own
+    /// register (`local-strata.ts:246-248`, the same register as its 429 retry line).
+    fn log_relays_exhausted(&self) {
+        tracing::info!(
+            "[failover] {} exhausted \u{2014} no upstream relays remain",
+            self.id()
+        );
     }
 
     /// The credential axis, per the family's drain shape.
